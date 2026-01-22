@@ -1,6 +1,8 @@
 package com.example.bp
 
+import android.annotation.SuppressLint
 import android.view.Choreographer
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceView
 import androidx.compose.runtime.Composable
@@ -15,7 +17,9 @@ import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.sqrt
 
+@SuppressLint("ClickableViewAccessibility")
 @Composable
 fun ModelViewer(modifier: Modifier = Modifier) {
     AndroidView(
@@ -52,7 +56,8 @@ fun ModelViewer(modifier: Modifier = Modifier) {
             val assetLoader = AssetLoader(engine, materialProvider, EntityManager.get())
             val resourceLoader = ResourceLoader(engine)
 
-            var asset: FilamentAsset? = null
+            var asset: FilamentAsset?
+            val modelCenter = FloatArray(3)
 
             try {
                 val bytes = context.assets.open("models/DamagedHelmet.glb").readBytes()
@@ -67,14 +72,44 @@ fun ModelViewer(modifier: Modifier = Modifier) {
                     scene.addEntities(it.entities)
 
                     val c = it.boundingBox.center
-                    camera.lookAt(
-                        3.0, 2.0, 6.0,
-                        c[0].toDouble(), c[1].toDouble(), c[2].toDouble(),
-                        0.0, 1.0, 0.0
-                    )
+                    modelCenter[0] = c[0]
+                    modelCenter[1] = c[1]
+                    modelCenter[2] = c[2]
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            }
+
+            // ---------- CAMERA CONTROL ----------
+            var cameraDistance = 6.0
+            var cameraAngleX = 0.0 // rotace kolem Y osy (vlevo-vpravo)
+            var cameraAngleY = 20.0 // rotace kolem X osy (nahoru-dolů)
+
+            var lastTouchX = 0f
+            var lastTouchY = 0f
+            var initialDistance = 0f
+
+            fun updateCamera() {
+                val angleXRad = cameraAngleX * PI / 180.0
+                val angleYRad = cameraAngleY * PI / 180.0
+
+                val eyeX = modelCenter[0] + cameraDistance * cos(angleYRad) * sin(angleXRad)
+                val eyeY = modelCenter[1] + cameraDistance * sin(angleYRad)
+                val eyeZ = modelCenter[2] + cameraDistance * cos(angleYRad) * cos(angleXRad)
+
+                camera.lookAt(
+                    eyeX, eyeY, eyeZ,
+                    modelCenter[0].toDouble(),
+                    modelCenter[1].toDouble(),
+                    modelCenter[2].toDouble(),
+                    0.0, 1.0, 0.0
+                )
+            }
+
+            fun getDistance(event: MotionEvent): Float {
+                val dx = event.getX(0) - event.getX(1)
+                val dy = event.getY(0) - event.getY(1)
+                return sqrt(dx * dx + dy * dy)
             }
 
             // ---------- SURFACE ----------
@@ -84,6 +119,51 @@ fun ModelViewer(modifier: Modifier = Modifier) {
 
             var swapChain: SwapChain? = null
 
+            // Touch listener pro ovládání kamery
+            surfaceView.setOnTouchListener { v, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        lastTouchX = event.x
+                        lastTouchY = event.y
+                        true
+                    }
+                    MotionEvent.ACTION_POINTER_DOWN -> {
+                        if (event.pointerCount == 2) {
+                            initialDistance = getDistance(event)
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (event.pointerCount == 2) {
+                            // Pinch to zoom
+                            val currentDistance = getDistance(event)
+                            val scale = initialDistance / currentDistance
+                            cameraDistance *= scale
+                            cameraDistance = cameraDistance.coerceIn(2.0, 15.0)
+                            initialDistance = currentDistance
+                        } else {
+                            // Rotace kamery
+                            val dx = event.x - lastTouchX
+                            val dy = event.y - lastTouchY
+
+                            cameraAngleX += dx * 0.3
+                            cameraAngleY -= dy * 0.3
+                            cameraAngleY = cameraAngleY.coerceIn(-89.0, 89.0)
+
+                            lastTouchX = event.x
+                            lastTouchY = event.y
+                        }
+                        updateCamera()
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        v.performClick()
+                        true
+                    }
+                    else -> false
+                }
+            }
+
             uiHelper.renderCallback = object : UiHelper.RendererCallback {
 
                 override fun onNativeWindowChanged(surface: Surface) {
@@ -91,36 +171,10 @@ fun ModelViewer(modifier: Modifier = Modifier) {
                     swapChain = engine.createSwapChain(surface)
                     displayHelper.attach(renderer, surfaceView.display)
 
+                    updateCamera()
+
                     val frameCallback = object : Choreographer.FrameCallback {
-                        private var startTime = 0L
-
                         override fun doFrame(frameTimeNanos: Long) {
-                            if (startTime == 0L) startTime = frameTimeNanos
-
-                            asset?.let {
-                                val seconds =
-                                    (frameTimeNanos - startTime) / 1_000_000_000.0
-
-                                val angle =
-                                    (seconds * (25.0 * PI / 180.0)).toFloat()
-
-                                val c = cos(angle)
-                                val s = sin(angle)
-
-                                val rotationY = floatArrayOf(
-                                    c,  0f, -s, 0f,
-                                    0f, 1f,  0f, 0f,
-                                    s,  0f,  c, 0f,
-                                    0f, 0f,  0f, 1f
-                                )
-
-                                val tm = engine.transformManager
-                                tm.setTransform(
-                                    tm.getInstance(it.root),
-                                    rotationY
-                                )
-                            }
-
                             if (surfaceView.height > 0) {
                                 val aspect =
                                     surfaceView.width.toDouble() / surfaceView.height
