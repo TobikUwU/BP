@@ -6,13 +6,21 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceView
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import com.google.android.filament.*
 import com.google.android.filament.android.DisplayHelper
 import com.google.android.filament.android.UiHelper
 import com.google.android.filament.gltfio.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.PI
@@ -30,10 +38,19 @@ enum class ModelSource {
 fun ModelViewer(
     modifier: Modifier = Modifier,
     modelSource: ModelSource = ModelSource.ASSETS,
-    modelPath: String = "models/DamagedHelmet.glb"  // Pro ASSETS: cesta v assets, pro FILE: absolutní cesta
+    modelPath: String = "models/DamagedHelmet.glb"
 ) {
+    val context = LocalContext.current
+    val scope = remember { CoroutineScope(Dispatchers.Main) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            android.util.Log.d("ModelViewer", "ModelViewer disposed")
+        }
+    }
+
     AndroidView(
-        factory = { context ->
+        factory = { ctx ->
 
             Filament.init()
             Gltfio.init()
@@ -66,38 +83,96 @@ fun ModelViewer(
             val assetLoader = AssetLoader(engine, materialProvider, EntityManager.get())
             val resourceLoader = ResourceLoader(engine)
 
-            var asset: FilamentAsset?
             val modelCenter = FloatArray(3)
 
-            try {
-                val bytes = when (modelSource) {
-                    ModelSource.ASSETS -> {
-                        // Načti z assets
-                        context.assets.open(modelPath).readBytes()
+            // Načti model na background threadu
+            scope.launch(Dispatchers.Main) {
+                try {
+                    android.util.Log.d("ModelViewer", "Starting model load...")
+
+                    // Načti soubor do bufferu na IO threadu
+                    val buffer = withContext(Dispatchers.IO) {
+                        when (modelSource) {
+                            ModelSource.ASSETS -> {
+                                context.assets.open(modelPath).use { inputStream ->
+                                    val bytes = inputStream.readBytes()
+                                    ByteBuffer.allocateDirect(bytes.size)
+                                        .order(ByteOrder.nativeOrder())
+                                        .put(bytes)
+                                        .flip() as ByteBuffer
+                                }
+                            }
+                            ModelSource.FILE -> {
+                                val file = File(modelPath)
+                                if (!file.exists()) {
+                                    throw IllegalArgumentException("Model soubor neexistuje: $modelPath")
+                                }
+
+                                val fileSize = file.length()
+                                val maxSize = 200 * 1024 * 1024 // 200 MB limit
+
+                                if (fileSize > maxSize) {
+                                    android.util.Log.e("ModelViewer", "Model je příliš velký: ${fileSize / (1024 * 1024)} MB")
+                                    throw IllegalArgumentException("Model je příliš velký (max 200 MB)")
+                                }
+
+                                android.util.Log.d("ModelViewer", "Loading model: ${fileSize / (1024 * 1024)} MB")
+
+                                FileInputStream(file).use { inputStream ->
+                                    val chunkSize = 1024 * 1024 // 1 MB chunks
+                                    val totalBytes = fileSize.toInt()
+                                    val buffer = ByteBuffer.allocateDirect(totalBytes)
+                                        .order(ByteOrder.nativeOrder())
+
+                                    val chunk = ByteArray(chunkSize)
+                                    var bytesRead: Int
+                                    var totalRead = 0
+
+                                    while (inputStream.read(chunk).also { bytesRead = it } != -1) {
+                                        buffer.put(chunk, 0, bytesRead)
+                                        totalRead += bytesRead
+
+                                        if (totalRead % (10 * 1024 * 1024) == 0) {
+                                            android.util.Log.d("ModelViewer", "Loaded: ${totalRead / (1024 * 1024)} MB / ${totalBytes / (1024 * 1024)} MB")
+                                        }
+                                    }
+
+                                    buffer.flip()
+                                    buffer
+                                }
+                            }
+                        }
                     }
-                    ModelSource.FILE -> {
-                        // Načti ze souboru
-                        File(modelPath).readBytes()
+
+                    // Zpátky na main thread - všechny Filament operace musí být zde
+                    android.util.Log.d("ModelViewer", "Creating asset from buffer...")
+                    val asset = assetLoader.createAsset(buffer)
+
+                    asset?.let {
+                        android.util.Log.d("ModelViewer", "Loading resources (this may take a while)...")
+
+                        // Synchronní načtení (musí být na main threadu)
+                        resourceLoader.loadResources(it)
+
+                        android.util.Log.d("ModelViewer", "Releasing source data...")
+                        it.releaseSourceData()
+
+                        android.util.Log.d("ModelViewer", "Adding entities to scene...")
+                        scene.addEntities(it.entities)
+
+                        val c = it.boundingBox.center
+                        modelCenter[0] = c[0]
+                        modelCenter[1] = c[1]
+                        modelCenter[2] = c[2]
+
+                        android.util.Log.d("ModelViewer", "Model loaded successfully!")
                     }
+                } catch (e: OutOfMemoryError) {
+                    android.util.Log.e("ModelViewer", "Out of memory loading model!", e)
+                } catch (e: Exception) {
+                    android.util.Log.e("ModelViewer", "Error loading model", e)
+                    e.printStackTrace()
                 }
-
-                val buffer = ByteBuffer.allocateDirect(bytes.size)
-                    .order(ByteOrder.nativeOrder())
-                buffer.put(bytes).flip()
-
-                asset = assetLoader.createAsset(buffer)
-                asset?.let {
-                    resourceLoader.loadResources(it)
-                    it.releaseSourceData()
-                    scene.addEntities(it.entities)
-
-                    val c = it.boundingBox.center
-                    modelCenter[0] = c[0]
-                    modelCenter[1] = c[1]
-                    modelCenter[2] = c[2]
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
             }
 
             // ---------- CAMERA CONTROL ----------
@@ -133,9 +208,9 @@ fun ModelViewer(
             }
 
             // ---------- SURFACE ----------
-            val surfaceView = SurfaceView(context)
+            val surfaceView = SurfaceView(ctx)
             val uiHelper = UiHelper(UiHelper.ContextErrorPolicy.DONT_CHECK)
-            val displayHelper = DisplayHelper(context)
+            val displayHelper = DisplayHelper(ctx)
 
             var swapChain: SwapChain? = null
 

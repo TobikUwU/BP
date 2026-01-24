@@ -8,6 +8,10 @@ android {
     namespace = "com.example.bp"
     compileSdk {
         version = release(36)
+
+        dexOptions {
+            javaMaxHeapSize = "4g"
+        }
     }
 
     defaultConfig {
