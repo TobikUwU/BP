@@ -12,6 +12,7 @@ import com.google.android.filament.*
 import com.google.android.filament.android.DisplayHelper
 import com.google.android.filament.android.UiHelper
 import com.google.android.filament.gltfio.*
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.PI
@@ -19,9 +20,18 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+enum class ModelSource {
+    ASSETS,     // Model z assets složky
+    FILE        // Model ze souboru (stažený)
+}
+
 @SuppressLint("ClickableViewAccessibility")
 @Composable
-fun ModelViewer(modifier: Modifier = Modifier) {
+fun ModelViewer(
+    modifier: Modifier = Modifier,
+    modelSource: ModelSource = ModelSource.ASSETS,
+    modelPath: String = "models/DamagedHelmet.glb"  // Pro ASSETS: cesta v assets, pro FILE: absolutní cesta
+) {
     AndroidView(
         factory = { context ->
 
@@ -60,7 +70,17 @@ fun ModelViewer(modifier: Modifier = Modifier) {
             val modelCenter = FloatArray(3)
 
             try {
-                val bytes = context.assets.open("models/DamagedHelmet.glb").readBytes()
+                val bytes = when (modelSource) {
+                    ModelSource.ASSETS -> {
+                        // Načti z assets
+                        context.assets.open(modelPath).readBytes()
+                    }
+                    ModelSource.FILE -> {
+                        // Načti ze souboru
+                        File(modelPath).readBytes()
+                    }
+                }
+
                 val buffer = ByteBuffer.allocateDirect(bytes.size)
                     .order(ByteOrder.nativeOrder())
                 buffer.put(bytes).flip()
@@ -82,8 +102,8 @@ fun ModelViewer(modifier: Modifier = Modifier) {
 
             // ---------- CAMERA CONTROL ----------
             var cameraDistance = 6.0
-            var cameraAngleX = 0.0 // rotace kolem Y osy (vlevo-vpravo)
-            var cameraAngleY = 20.0 // rotace kolem X osy (nahoru-dolů)
+            var cameraAngleX = 0.0
+            var cameraAngleY = 20.0
 
             var lastTouchX = 0f
             var lastTouchY = 0f
@@ -119,7 +139,6 @@ fun ModelViewer(modifier: Modifier = Modifier) {
 
             var swapChain: SwapChain? = null
 
-            // Touch listener pro ovládání kamery
             surfaceView.setOnTouchListener { v, event ->
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
@@ -135,14 +154,12 @@ fun ModelViewer(modifier: Modifier = Modifier) {
                     }
                     MotionEvent.ACTION_MOVE -> {
                         if (event.pointerCount == 2) {
-                            // Pinch to zoom
                             val currentDistance = getDistance(event)
                             val scale = initialDistance / currentDistance
                             cameraDistance *= scale
                             cameraDistance = cameraDistance.coerceIn(2.0, 15.0)
                             initialDistance = currentDistance
                         } else {
-                            // Rotace kamery
                             val dx = event.x - lastTouchX
                             val dy = event.y - lastTouchY
 
@@ -176,15 +193,8 @@ fun ModelViewer(modifier: Modifier = Modifier) {
                     val frameCallback = object : Choreographer.FrameCallback {
                         override fun doFrame(frameTimeNanos: Long) {
                             if (surfaceView.height > 0) {
-                                val aspect =
-                                    surfaceView.width.toDouble() / surfaceView.height
-                                camera.setProjection(
-                                    45.0,
-                                    aspect,
-                                    0.1,
-                                    20.0,
-                                    Camera.Fov.VERTICAL
-                                )
+                                val aspect = surfaceView.width.toDouble() / surfaceView.height
+                                camera.setProjection(45.0, aspect, 0.1, 20.0, Camera.Fov.VERTICAL)
                             }
 
                             swapChain?.let { sc ->

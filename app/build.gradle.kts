@@ -56,6 +56,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
 
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     val filamentVersion = "1.68.4"
     implementation("com.google.android.filament:filament-android:$filamentVersion")
     implementation("com.google.android.filament:gltfio-android:$filamentVersion")
