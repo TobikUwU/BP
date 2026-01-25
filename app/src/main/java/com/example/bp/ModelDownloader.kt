@@ -18,8 +18,7 @@ data class ModelInfo(
 
 class ModelDownloader(private val context: Context) {
 
-    private val serverUrl = "http://192.168.50.96:3000" // Pro emulátor (localhost)
-    // Pro reálné zařízení použij IP adresu počítače, např: "http://192.168.1.100:3000"
+    private val serverUrl = "http://192.168.50.96:3000"
 
     companion object {
         private const val TAG = "ModelDownloader"
