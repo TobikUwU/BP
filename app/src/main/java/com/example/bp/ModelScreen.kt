@@ -1,13 +1,22 @@
 package com.example.bp
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -21,20 +30,12 @@ fun ModelScreen() {
     var downloadedModelPath by remember { mutableStateOf<String?>(null) }
     var isModelLoading by remember { mutableStateOf(false) }
 
-    // Když se model stáhne, nastav loading state
-    LaunchedEffect(downloadedModelPath) {
-        if (downloadedModelPath != null) {
-            isModelLoading = true
-            // Po 10 sekundách skryj loading (model by měl být načtený)
-            kotlinx.coroutines.delay(10000)
-            isModelLoading = false
-        }
-    }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    var downloadProgress by remember { mutableStateOf(0f) }
-    var downloadedMB by remember { mutableStateOf(0L) }
-    var totalMB by remember { mutableStateOf(0L) }
+
+    // Nový progress state pro chunked download
+    var downloadProgress by remember { mutableStateOf<DownloadProgress?>(null) }
+    var cacheSize by remember { mutableStateOf(0L) }
 
     // Načti seznam modelů při startu
     LaunchedEffect(Unit) {
@@ -42,6 +43,7 @@ fun ModelScreen() {
         errorMessage = null
         try {
             availableModels = downloader.getAvailableModels()
+            cacheSize = downloader.getCacheSize()
             if (availableModels.isEmpty()) {
                 errorMessage = "Žádné modely na serveru. Zkontrolujte, zda server běží."
             }
@@ -50,6 +52,31 @@ fun ModelScreen() {
             android.util.Log.e("ModelScreen", "Error loading models", e)
         } finally {
             isLoading = false
+        }
+    }
+
+    // Formátovací funkce
+    fun formatBytes(bytes: Long): String {
+        return when {
+            bytes < 1024 -> "$bytes B"
+            bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+            else -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+        }
+    }
+
+    fun formatSpeed(bytesPerSecond: Long): String {
+        return when {
+            bytesPerSecond < 1024 -> "$bytesPerSecond B/s"
+            bytesPerSecond < 1024 * 1024 -> "${bytesPerSecond / 1024} KB/s"
+            else -> "%.1f MB/s".format(bytesPerSecond / (1024.0 * 1024.0))
+        }
+    }
+
+    fun formatTime(seconds: Long): String {
+        return when {
+            seconds < 60 -> "${seconds}s"
+            seconds < 3600 -> "${seconds / 60}m ${seconds % 60}s"
+            else -> "${seconds / 3600}h ${(seconds % 3600) / 60}m"
         }
     }
 
@@ -64,19 +91,76 @@ fun ModelScreen() {
             Column(
                 modifier = Modifier.padding(16.dp)
             ) {
-                Text(
-                    text = "3D Model Viewer",
-                    style = MaterialTheme.typography.headlineSmall
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "3D Model Viewer",
+                        style = MaterialTheme.typography.headlineSmall
+                    )
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        // Refresh button
+                        IconButton(
+                            onClick = {
+                                scope.launch {
+                                    isLoading = true
+                                    availableModels = downloader.getAvailableModels()
+                                    cacheSize = downloader.getCacheSize()
+                                    isLoading = false
+                                }
+                            },
+                            enabled = !isLoading
+                        ) {
+                            Icon(Icons.Default.Refresh, "Obnovit seznam")
+                        }
+
+                        // Clear cache button
+                        if (cacheSize > 0) {
+                            IconButton(
+                                onClick = {
+                                    downloader.clearCache()
+                                    cacheSize = 0
+                                }
+                            ) {
+                                Badge(
+                                    containerColor = MaterialTheme.colorScheme.error
+                                ) {
+                                    Text(formatBytes(cacheSize))
+                                }
+                                Icon(Icons.Default.Delete, "Vyčistit cache")
+                            }
+                        }
+                    }
+                }
 
                 // Debug info
                 selectedModel?.let { model ->
                     if (downloader.isModelDownloaded(model.name)) {
-                        Text(
-                            text = "Stažený model: ${model.name} (${downloader.getModelSize(model.name)} MB)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer
+                            )
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                    text = "✓ Stažený model",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                                Text(
+                                    text = "${model.name} (${downloader.getModelSize(model.name)} MB)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -87,7 +171,7 @@ fun ModelScreen() {
 
                 ExposedDropdownMenuBox(
                     expanded = expanded,
-                    onExpandedChange = { expanded = !expanded }
+                    onExpandedChange = { expanded = !expanded && !isLoading }
                 ) {
                     OutlinedTextField(
                         value = selectedModel?.name ?: "Vyberte model",
@@ -97,7 +181,8 @@ fun ModelScreen() {
                         modifier = Modifier
                             .fillMaxWidth()
                             .menuAnchor(),
-                        label = { Text("Model ze serveru") }
+                        label = { Text("Model ze serveru") },
+                        enabled = !isLoading
                     )
 
                     ExposedDropdownMenu(
@@ -107,13 +192,37 @@ fun ModelScreen() {
                         availableModels.forEach { model ->
                             DropdownMenuItem(
                                 text = {
-                                    Column {
-                                        Text(model.name)
-                                        Text(
-                                            text = "${model.sizeInMB} MB",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.outline
-                                        )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(model.name)
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Text(
+                                                    text = "${model.sizeInMB} MB",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.outline
+                                                )
+                                                if (model.chunked) {
+                                                    Text(
+                                                        text = "⚡ ${model.totalChunks} chunks",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.primary
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        if (downloader.isModelDownloaded(model.name)) {
+                                            Icon(
+                                                imageVector = Icons.Default.Delete,
+                                                contentDescription = "Staženo",
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                        }
                                     }
                                 },
                                 onClick = {
@@ -127,78 +236,224 @@ fun ModelScreen() {
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Tlačítko pro stažení
-                Button(
-                    onClick = {
-                        selectedModel?.let { model ->
-                            scope.launch {
-                                isLoading = true
-                                errorMessage = null
-                                downloadProgress = 0f
-
-                                // Zkontroluj, zda už je stažený
-                                if (downloader.isModelDownloaded(model.name)) {
-                                    downloadedModelPath = downloader.getModelPath(model.name)
-                                    isLoading = false
-                                    return@launch
-                                }
-
-                                // Jinak stáhni s progress tracking
-                                val file = downloader.downloadModel(model.name) { downloaded, total ->
-                                    downloadedMB = downloaded / (1024 * 1024)
-                                    totalMB = total / (1024 * 1024)
-                                    downloadProgress = if (total > 0) downloaded.toFloat() / total else 0f
-                                }
-
-                                if (file != null) {
-                                    downloadedModelPath = file.absolutePath
-                                } else {
-                                    errorMessage = "Stahování selhalo"
-                                }
-                                isLoading = false
-                                downloadProgress = 0f
-                            }
-                        }
-                    },
-                    enabled = selectedModel != null && !isLoading,
-                    modifier = Modifier.fillMaxWidth()
+                // Tlačítka pro akce
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    if (isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            color = MaterialTheme.colorScheme.onPrimary
+                    // Tlačítko pro stažení/zobrazení
+                    Button(
+                        onClick = {
+                            selectedModel?.let { model ->
+                                scope.launch {
+                                    isLoading = true
+                                    errorMessage = null
+                                    downloadProgress = null
+
+                                    // Zkontroluj, zda už je stažený
+                                    if (downloader.isModelDownloaded(model.name)) {
+                                        downloadedModelPath = downloader.getModelPath(model.name)
+                                        isLoading = false
+                                        return@launch
+                                    }
+
+                                    // Stáhni s chunked supportem
+                                    val file = downloader.downloadModelChunked(model.name) { progress ->
+                                        downloadProgress = progress
+                                    }
+
+                                    if (file != null) {
+                                        downloadedModelPath = file.absolutePath
+                                        cacheSize = downloader.getCacheSize()
+                                    } else {
+                                        errorMessage = "Stahování selhalo - zkontrolujte připojení"
+                                    }
+
+                                    isLoading = false
+                                    downloadProgress = null
+                                }
+                            }
+                        },
+                        enabled = selectedModel != null && !isLoading,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (isLoading && downloadProgress == null) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        Text(
+                            text = when {
+                                selectedModel?.name?.let { downloader.isModelDownloaded(it) } == true ->
+                                    "Zobrazit model"
+                                else -> "Stáhnout model"
+                            }
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
                     }
-                    Text(
-                        text = if (selectedModel?.name?.let { downloader.isModelDownloaded(it) } == true)
-                            "Model je stažený (${downloader.getModelSize(selectedModel!!.name)} MB) - Zobrazit"
-                        else
-                            "Stáhnout a zobrazit"
-                    )
+
+                    // Tlačítko pro smazání staženého modelu
+                    if (selectedModel?.name?.let { downloader.isModelDownloaded(it) } == true) {
+                        OutlinedButton(
+                            onClick = {
+                                selectedModel?.let { model ->
+                                    if (downloader.deleteModel(model.name)) {
+                                        if (downloadedModelPath == downloader.getModelPath(model.name)) {
+                                            downloadedModelPath = null
+                                        }
+                                    }
+                                }
+                            }
+                        ) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "Smazat",
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
                 }
 
-                // Progress bar při stahování
-                if (isLoading && downloadProgress > 0f) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        progress = { downloadProgress },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Text(
-                        text = "Staženo: $downloadedMB MB / $totalMB MB (${(downloadProgress * 100).toInt()}%)",
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                // Pokročilý progress bar s detaily
+                AnimatedVisibility(
+                    visible = isLoading && downloadProgress != null,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    downloadProgress?.let { progress ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.secondaryContainer
+                            )
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                // Hlavní info
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = "Stahování...",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = "${((progress.downloadedBytes.toFloat() / progress.totalBytes) * 100).roundToInt()}%",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                // Progress bar
+                                val animatedProgress by animateFloatAsState(
+                                    targetValue = progress.downloadedBytes.toFloat() / progress.totalBytes,
+                                    label = "progress"
+                                )
+                                LinearProgressIndicator(
+                                    progress = { animatedProgress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(8.dp),
+                                )
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                // Detaily
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    if (progress.totalChunks > 0) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = "📦 Chunks:",
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                            Text(
+                                                text = "${progress.downloadedChunks} / ${progress.totalChunks}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "💾 Staženo:",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                        Text(
+                                            text = "${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "⚡ Rychlost:",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                        Text(
+                                            text = formatSpeed(progress.currentSpeed),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+
+                                    if (progress.eta > 0) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = "⏱️ Zbývá:",
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                            Text(
+                                                text = formatTime(progress.eta),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Chybová zpráva
                 errorMessage?.let { error ->
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = error,
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        )
+                    ) {
+                        Text(
+                            text = "❌ $error",
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
                 }
             }
         }
@@ -210,7 +465,6 @@ fun ModelScreen() {
         ) {
             when {
                 downloadedModelPath != null -> {
-                    // Zobraz loading při načítání modelu
                     Box(modifier = Modifier.fillMaxSize()) {
                         ModelViewer(
                             modifier = Modifier.fillMaxSize(),
@@ -218,36 +472,84 @@ fun ModelScreen() {
                             modelPath = downloadedModelPath!!
                         )
 
-                        // Overlay text pro velké modely
-                        if (selectedModel?.sizeInMB ?: 0.0 > 50.0) {
+                        // Overlay pro velké modely
+                        if (selectedModel?.sizeInMB ?: 0.0 > 50.0 && isModelLoading) {
                             Surface(
                                 modifier = Modifier
                                     .align(Alignment.TopCenter)
                                     .padding(16.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.95f),
                                 shape = MaterialTheme.shapes.medium
                             ) {
-                                Text(
-                                    text = "⚠️ Načítání velkého modelu (${selectedModel?.sizeInMB} MB)\nMůže trvat několik sekund...",
-                                    modifier = Modifier.padding(12.dp),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                                )
+                                Row(
+                                    modifier = Modifier.padding(16.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Column {
+                                        Text(
+                                            text = "Načítání velkého modelu...",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                        Text(
+                                            text = "${selectedModel?.sizeInMB} MB - může trvat několik sekund",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
+
+                    // Po načtení modelu skryj loading
+                    LaunchedEffect(downloadedModelPath) {
+                        isModelLoading = true
+                        kotlinx.coroutines.delay(10000)
+                        isModelLoading = false
+                    }
                 }
                 isLoading -> {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
                         CircularProgressIndicator()
-                        if (downloadProgress > 0f) {
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text("Stahování: ${(downloadProgress * 100).toInt()}%")
-                        }
+                        Text(
+                            text = if (downloadProgress != null)
+                                "Stahování..."
+                            else
+                                "Načítání...",
+                            style = MaterialTheme.typography.bodyLarge
+                        )
                     }
                 }
                 else -> {
-                    Text("Vyberte a stáhněte model ze serveru")
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "👆",
+                            style = MaterialTheme.typography.displayMedium
+                        )
+                        Text(
+                            text = "Vyberte model ze seznamu",
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                        if (availableModels.isNotEmpty()) {
+                            Text(
+                                text = "${availableModels.size} modelů k dispozici",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
+                    }
                 }
             }
         }
