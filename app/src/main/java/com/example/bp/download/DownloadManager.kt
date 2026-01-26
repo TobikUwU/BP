@@ -13,6 +13,11 @@ class DownloadManager(private val context: Context) {
 
     private val parallelDownloader = ParallelModelDownloader(context)
     private val bandwidthMonitor = BandwidthMonitor(context)
+    private val progressiveLoader = ProgressiveModelLoader(context, parallelDownloader)  // 🆕
+
+    // 🆕 DEBUG FLAGS
+    var debugForceParallel = false
+    var debugParallelCount = 5
 
     // Download queue
     private val _downloadQueue = MutableStateFlow<List<QueuedDownload>>(emptyList())
@@ -47,7 +52,8 @@ class DownloadManager(private val context: Context) {
         val useParallel: Boolean,
         val maxParallelChunks: Int,
         val compressionEnabled: Boolean,
-        val qualityMode: QualityMode
+        val qualityMode: QualityMode,
+        val useProgressive: Boolean  // 🆕
     )
 
     enum class QualityMode {
@@ -80,6 +86,7 @@ class DownloadManager(private val context: Context) {
             - Parallel: ${strategy.useParallel}
             - Max chunks: ${strategy.maxParallelChunks}
             - Quality: ${strategy.qualityMode}
+            - Progressive: ${strategy.useProgressive}
             - Network: ${bandwidthMonitor.networkStats.value.connectionType}
         """.trimIndent())
 
@@ -118,6 +125,54 @@ class DownloadManager(private val context: Context) {
             _currentDownload.value = DownloadState.Failed(modelInfo.name, e.message ?: "Unknown error")
             null
         }
+    }
+
+    /**
+     * 🆕 Stáhne model s preview-based progressive loading
+     * 1. Downloads small preview first (fast)
+     * 2. Displays preview immediately
+     * 3. Downloads full model in background
+     * 4. Swaps to full model when ready
+     */
+    suspend fun downloadModelProgressive(
+        modelInfo: ModelInfo,
+        onProgressiveState: (ProgressiveModelLoader.PreviewLoadResult) -> Unit
+    ): File? {
+        Log.d(TAG, "Starting preview-based progressive download for ${modelInfo.name}")
+
+        _currentDownload.value = DownloadState.Preparing(modelInfo.name)
+
+        return try {
+            val file = progressiveLoader.downloadWithPreview(
+                modelInfo,
+                onProgressiveState
+            )
+
+            if (file != null) {
+                _currentDownload.value = DownloadState.Completed(modelInfo.name, file)
+                Log.d(TAG, "Progressive download completed: ${modelInfo.name}")
+            } else {
+                // Fallback to normal download if preview not available
+                Log.d(TAG, "Preview not available, falling back to normal download")
+                _currentDownload.value = DownloadState.Failed(
+                    modelInfo.name,
+                    "Progressive download failed - no preview available"
+                )
+            }
+
+            file
+        } catch (e: Exception) {
+            Log.e(TAG, "Progressive download error", e)
+            _currentDownload.value = DownloadState.Failed(modelInfo.name, e.message ?: "Unknown error")
+            null
+        }
+    }
+
+    /**
+     * 🆕 Vrátí true pokud model podporuje progressive loading (now based on preview availability)
+     */
+    fun supportsProgressiveLoading(modelInfo: ModelInfo): Boolean {
+        return modelInfo.hasPreview  // Now based on preview availability
     }
 
     /**
@@ -160,18 +215,28 @@ class DownloadManager(private val context: Context) {
         val networkStats = bandwidthMonitor.networkStats.value
         val modelSizeBytes = (modelInfo.sizeInMB * 1024 * 1024).toLong()
 
-        // Rozhodnutí o paralelním stahování
+        // 🆕 TEMPORARY FIX: Force parallel if we can download at all
         val useParallel = when (networkStats.connectionType) {
+            BandwidthMonitor.ConnectionType.OFFLINE -> {
+                // Pokud download vůbec funguje, pravděpodobně nejsme OFFLINE
+                Log.w(TAG, "Network detected as OFFLINE but attempting parallel download anyway")
+                modelSizeBytes > 10 * 1024 * 1024 // >10MB
+            }
             BandwidthMonitor.ConnectionType.WIFI,
             BandwidthMonitor.ConnectionType.ETHERNET -> true
-            BandwidthMonitor.ConnectionType.CELLULAR_5G -> modelSizeBytes > 10 * 1024 * 1024 // >10MB
-            BandwidthMonitor.ConnectionType.CELLULAR_4G -> modelSizeBytes > 50 * 1024 * 1024 // >50MB
+            BandwidthMonitor.ConnectionType.CELLULAR_5G -> modelSizeBytes > 10 * 1024 * 1024
+            BandwidthMonitor.ConnectionType.CELLULAR_4G -> modelSizeBytes > 50 * 1024 * 1024
             else -> false
         }
 
         // Počet paralelních chunků
         val maxParallel = if (useParallel) {
-            networkStats.recommendedParallelism
+            if (networkStats.recommendedParallelism > 1) {
+                networkStats.recommendedParallelism
+            } else {
+                // 🆕 Default fallback pokud není známa rychlost
+                3 // Rozumný default
+            }
         } else {
             1
         }
@@ -179,7 +244,6 @@ class DownloadManager(private val context: Context) {
         // Kvalita podle typu připojení
         val qualityMode = when {
             networkStats.isMetered && networkStats.connectionType != BandwidthMonitor.ConnectionType.WIFI -> {
-                // Na mobilních datech nabídni nižší kvalitu
                 when (networkStats.connectionType) {
                     BandwidthMonitor.ConnectionType.CELLULAR_5G -> QualityMode.HIGH
                     BandwidthMonitor.ConnectionType.CELLULAR_4G -> QualityMode.MEDIUM
@@ -189,11 +253,19 @@ class DownloadManager(private val context: Context) {
             else -> QualityMode.ULTRA
         }
 
+        // 🆕 Progressive loading decision
+        val useProgressive = modelInfo.chunked &&
+                modelInfo.totalChunks >= 10 &&
+                modelSizeBytes > 10 * 1024 * 1024  // >10MB
+
+        Log.d(TAG, "Strategy: parallel=$useParallel, maxParallel=$maxParallel, quality=$qualityMode, progressive=$useProgressive")
+
         return DownloadStrategy(
             useParallel = useParallel,
             maxParallelChunks = maxParallel,
-            compressionEnabled = networkStats.isMetered, // Komprese na metered
-            qualityMode = qualityMode
+            compressionEnabled = networkStats.isMetered,
+            qualityMode = qualityMode,
+            useProgressive = useProgressive
         )
     }
 
@@ -222,6 +294,11 @@ class DownloadManager(private val context: Context) {
             append("📦 Strategie: ")
             append(if (strategy.useParallel) "Paralelní (${strategy.maxParallelChunks}×)" else "Sekvenční")
             append("\n")
+
+            // 🆕 Progressive loading info
+            if (strategy.useProgressive) {
+                append("🎨 Progressive: Zobrazí se při 10%\n")
+            }
 
             append("🎨 Kvalita: ${strategy.qualityMode.name}\n")
 

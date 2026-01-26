@@ -214,8 +214,10 @@ class ParallelModelDownloader(private val context: Context) {
             val cachedChunk = getCachedChunk(modelName, chunkIndex)
             val chunkData = if (cachedChunk != null &&
                 verifyChunkHash(cachedChunk, metadata.chunkHashes[chunkIndex])) {
+                Log.d(TAG, "Using cached chunk $chunkIndex")
                 cachedChunk
             } else {
+                // Stáhni chunk
                 downloadChunk(modelName, chunkIndex)
             }
 
@@ -225,6 +227,17 @@ class ParallelModelDownloader(private val context: Context) {
 
             // Ověř hash
             if (!verifyChunkHash(chunkData, metadata.chunkHashes[chunkIndex])) {
+                Log.e(TAG, "Chunk $chunkIndex hash mismatch!")
+                Log.e(TAG, "  Expected: ${metadata.chunkHashes[chunkIndex]}")
+                Log.e(TAG, "  Got: ${MessageDigest.getInstance("SHA-256").digest(chunkData).joinToString("") { "%02x".format(it) }}")
+                Log.e(TAG, "  Size: ${chunkData.size} bytes")
+
+                // 🆕 Smaž vadnou cache
+                val cacheFile = File(cacheDir, "${modelName}_chunk_$chunkIndex")
+                if (cacheFile.exists()) {
+                    cacheFile.delete()
+                    Log.d(TAG, "Deleted corrupted cache for chunk $chunkIndex")
+                }
                 throw Exception("Chunk hash mismatch")
             }
 
@@ -232,16 +245,24 @@ class ParallelModelDownloader(private val context: Context) {
             saveCachedChunk(modelName, chunkIndex, chunkData)
 
             // Zapiš do souboru
-            RandomAccessFile(outputFile, "rw").use { raf ->
-                raf.seek(chunkIndex.toLong() * metadata.chunkSize)
-                raf.write(chunkData)
+            synchronized(outputFile) {  // 🆕 Thread-safe zápis
+                RandomAccessFile(outputFile, "rw").use { raf ->
+                    raf.seek(chunkIndex.toLong() * metadata.chunkSize)
+                    raf.write(chunkData)
+                }
             }
 
             chunkData.size
 
         } catch (e: Exception) {
+            Log.w(TAG, "Chunk $chunkIndex retry $retryCount failed: ${e.message}")
+
             if (retryCount < maxRetries) {
-                delay(retryDelayMs * (retryCount + 1))
+                // 🆕 Exponential backoff s jitter
+                val baseDelay = retryDelayMs * (retryCount + 1)
+                val jitter = (Math.random() * 500).toLong()
+                delay(baseDelay + jitter)
+
                 downloadChunkWithRetry(modelName, chunkIndex, metadata, outputFile, retryCount + 1)
             } else {
                 Log.e(TAG, "Chunk $chunkIndex failed after $maxRetries retries")
@@ -251,10 +272,10 @@ class ParallelModelDownloader(private val context: Context) {
     }
 
     // ========================================================================
-    // HELPER METODY
+    // HELPER METODY - INTERNAL pro ProgressiveModelLoader
     // ========================================================================
 
-    private suspend fun getModelMetadata(modelName: String): ModelMetadata? =
+    internal suspend fun getModelMetadata(modelName: String): ModelMetadata? =
         withContext(Dispatchers.IO) {
             try {
                 val url = URL("$serverUrl/model-metadata/$modelName")
@@ -294,53 +315,79 @@ class ParallelModelDownloader(private val context: Context) {
             }
         }
 
-    private suspend fun downloadChunk(modelName: String, chunkIndex: Int): ByteArray? =
+    internal suspend fun downloadChunk(modelName: String, chunkIndex: Int): ByteArray? =
         withContext(Dispatchers.IO) {
+            var connection: HttpURLConnection? = null
             try {
                 val url = URL("$serverUrl/download-chunk/$modelName/$chunkIndex")
-                val connection = url.openConnection() as HttpURLConnection
+                connection = url.openConnection() as HttpURLConnection
                 connection.requestMethod = "GET"
                 connection.connectTimeout = 30000
                 connection.readTimeout = 60000
 
-                // 🆕 Požádej o GZIP kompresi
+                // Request GZIP compression
                 connection.setRequestProperty("Accept-Encoding", "gzip")
 
-                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-                    // 🆕 Zkontroluj, zda server poslal gzip
+                // 🆕 Přidej více headerů pro stability
+                connection.setRequestProperty("Connection", "close")  // Avoid keep-alive issues
+                connection.useCaches = false
+
+                val responseCode = connection.responseCode
+
+                if (responseCode == HttpURLConnection.HTTP_OK) {
+                    // Check for GZIP
                     val contentEncoding = connection.getHeaderField("Content-Encoding")
                     val isGzipped = contentEncoding?.contains("gzip") == true
 
+                    // 🆕 Manuální GZIP dekomprese!
                     val data = if (isGzipped) {
-                        // Automaticky dekompresi, HttpURLConnection to udělá za nás
-                        connection.inputStream.readBytes()
-                    } else {
-                        connection.inputStream.readBytes()
-                    }
+                        // Server poslal GZIP komprimovaná data → musíme je dekomprimovat
+                        val compressedData = connection.inputStream.use { stream ->
+                            stream.readBytes()
+                        }
 
-                    connection.disconnect()
+                        // Dekomprimuj pomocí GZIPInputStream
+                        val decompressed = java.util.zip.GZIPInputStream(
+                            java.io.ByteArrayInputStream(compressedData)
+                        ).use { gzipStream ->
+                            gzipStream.readBytes()
+                        }
 
-                    if (isGzipped) {
                         val originalSize = connection.getHeaderField("X-Original-Size")?.toLongOrNull()
-                        val compressedSize = connection.getHeaderField("X-Compressed-Size")?.toLongOrNull()
-                        if (originalSize != null && compressedSize != null) {
+                        val compressedSize = compressedData.size.toLong()
+                        if (originalSize != null && originalSize > 0) {
                             val savings = ((1 - compressedSize.toFloat() / originalSize) * 100).toInt()
-                            Log.d(TAG, "Chunk $chunkIndex: saved ${savings}% bandwidth")
+                            Log.d(TAG, "Chunk $chunkIndex: saved ${savings}% bandwidth (${compressedSize / 1024}KB → ${decompressed.size / 1024}KB)")
+                        }
+
+                        decompressed
+                    } else {
+                        // Server poslal nekomprimovaná data
+                        connection.inputStream.use { stream ->
+                            stream.readBytes()
                         }
                     }
 
                     data
                 } else {
-                    connection.disconnect()
+                    Log.e(TAG, "Chunk $chunkIndex HTTP error: $responseCode")
                     null
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error downloading chunk $chunkIndex", e)
+            } catch (e: java.net.SocketTimeoutException) {
+                Log.e(TAG, "Chunk $chunkIndex timeout: ${e.message}")
                 null
+            } catch (e: java.io.IOException) {
+                Log.e(TAG, "Chunk $chunkIndex IO error: ${e.message}")
+                null
+            } catch (e: Exception) {
+                Log.e(TAG, "Chunk $chunkIndex error: ${e.message}")
+                null
+            } finally {
+                connection?.disconnect()
             }
         }
 
-    private fun getCachedChunk(modelName: String, chunkIndex: Int): ByteArray? {
+    internal fun getCachedChunk(modelName: String, chunkIndex: Int): ByteArray? {
         val cacheFile = File(cacheDir, "${modelName}_chunk_$chunkIndex")
         return if (cacheFile.exists()) {
             try {
@@ -353,7 +400,7 @@ class ParallelModelDownloader(private val context: Context) {
         }
     }
 
-    private fun saveCachedChunk(modelName: String, chunkIndex: Int, data: ByteArray) {
+    internal fun saveCachedChunk(modelName: String, chunkIndex: Int, data: ByteArray) {
         try {
             val cacheFile = File(cacheDir, "${modelName}_chunk_$chunkIndex")
             cacheFile.writeBytes(data)
@@ -362,7 +409,7 @@ class ParallelModelDownloader(private val context: Context) {
         }
     }
 
-    private fun verifyChunkHash(data: ByteArray, expectedHash: String): Boolean {
+    internal fun verifyChunkHash(data: ByteArray, expectedHash: String): Boolean {
         val hash = MessageDigest.getInstance("SHA-256")
             .digest(data)
             .joinToString("") { "%02x".format(it) }
@@ -379,6 +426,61 @@ class ParallelModelDownloader(private val context: Context) {
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    // ========================================================================
+    // PREVIEW DOWNLOAD - Simple direct download for small preview files
+    // ========================================================================
+
+    /**
+     * Download a preview file directly (no chunking needed - previews are small)
+     */
+    suspend fun downloadPreview(previewName: String): File? = withContext(Dispatchers.IO) {
+        var connection: HttpURLConnection? = null
+        try {
+            val outputFile = File(modelsDir, previewName)
+
+            // Check if already downloaded
+            if (outputFile.exists() && outputFile.length() > 0) {
+                Log.d(TAG, "Preview already exists: ${outputFile.absolutePath}")
+                return@withContext outputFile
+            }
+
+            val url = URL("$serverUrl/download/$previewName")
+            connection = url.openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 10000
+            connection.readTimeout = 30000
+            connection.setRequestProperty("Accept-Encoding", "gzip")
+
+            val responseCode = connection.responseCode
+
+            if (responseCode == HttpURLConnection.HTTP_OK) {
+                val contentEncoding = connection.getHeaderField("Content-Encoding")
+                val isGzipped = contentEncoding?.contains("gzip") == true
+
+                val data = if (isGzipped) {
+                    val compressedData = connection.inputStream.use { it.readBytes() }
+                    java.util.zip.GZIPInputStream(
+                        java.io.ByteArrayInputStream(compressedData)
+                    ).use { it.readBytes() }
+                } else {
+                    connection.inputStream.use { it.readBytes() }
+                }
+
+                outputFile.writeBytes(data)
+                Log.d(TAG, "✅ Preview downloaded: ${outputFile.absolutePath} (${data.size / 1024} KB)")
+                outputFile
+            } else {
+                Log.e(TAG, "Preview download HTTP error: $responseCode")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Preview download error: ${e.message}", e)
+            null
+        } finally {
+            connection?.disconnect()
+        }
     }
 
     // ========================================================================

@@ -4,222 +4,138 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.*
 import java.io.File
-import java.io.RandomAccessFile
 
 /**
- * Progressive loading - zobrazuje model postupně během stahování
- * Vytváří LOD (Level of Detail) verze pro rychlejší načtení
+ * Progressive loading using server-side preview files
+ * 1. Download small preview file first (fast)
+ * 2. Display preview immediately
+ * 3. Download full model in background
+ * 4. Swap to full model when ready
  */
 class ProgressiveModelLoader(
     private val context: Context,
     private val downloader: ParallelModelDownloader
 ) {
 
-    data class ProgressiveLoadState(
-        val lodLevel: LODLevel,
-        val availableChunks: Int,
-        val totalChunks: Int,
-        val canDisplay: Boolean,
-        val modelFile: File?,
-        val loadPercentage: Float
-    )
-
-    enum class LODLevel(val percentage: Int, val description: String) {
-        NONE(0, "Nepřipraveno"),
-        LOW(10, "Nízká kvalita - základní geometrie"),
-        MEDIUM(30, "Střední kvalita"),
-        HIGH(60, "Vysoká kvalita"),
-        ULTRA(100, "Plná kvalita")
+    /**
+     * Progressive load states for preview-based loading
+     */
+    enum class ProgressiveLoadState {
+        LOADING_PREVIEW,    // Downloading preview file
+        PREVIEW_READY,      // Preview downloaded, can display
+        LOADING_FULL,       // Downloading full model in background
+        FULL_READY          // Full model ready
     }
+
+    /**
+     * Callback data for state changes
+     */
+    data class PreviewLoadResult(
+        val state: ProgressiveLoadState,
+        val previewFile: File? = null,
+        val fullFile: File? = null,
+        val previewProgress: Float = 0f,    // 0-1 for preview download
+        val fullProgress: Float = 0f,       // 0-1 for full model download
+        val message: String = ""
+    )
 
     companion object {
         private const val TAG = "ProgressiveLoader"
     }
 
     /**
-     * Stáhne model s progresivním zobrazením
-     * Callback je volán při dosažení každého LOD levelu
+     * Download with server-side preview
+     * 1. Check if preview exists (hasPreview)
+     * 2. Download preview file directly (no chunks)
+     * 3. Call onStateChange(PREVIEW_READY, previewFile)
+     * 4. Start downloading full model in background
+     * 5. Call onStateChange(FULL_READY, fullFile) when done
      */
-    suspend fun downloadWithProgressiveLoading(
-        modelName: String,
-        onStateChange: (ProgressiveLoadState) -> Unit
+    suspend fun downloadWithPreview(
+        modelInfo: ModelInfo,
+        onStateChange: (PreviewLoadResult) -> Unit
     ): File? = withContext(Dispatchers.IO) {
 
-        val metadata = downloader.getModelMetadata(modelName)
-
-        if (metadata == null) {
-            Log.d(TAG, "No metadata, progressive loading not available")
+        if (!modelInfo.hasPreview || modelInfo.previewName == null) {
+            Log.d(TAG, "No preview available for ${modelInfo.name}, falling back to normal download")
             return@withContext null
         }
 
-        val totalChunks = metadata.totalChunks
+        val modelsDir = File(context.filesDir, "models")
+        if (!modelsDir.exists()) modelsDir.mkdirs()
 
-        // Definuj LOD boundaries
-        val lodBoundaries = mapOf(
-            LODLevel.LOW to (totalChunks * 0.1).toInt(),
-            LODLevel.MEDIUM to (totalChunks * 0.3).toInt(),
-            LODLevel.HIGH to (totalChunks * 0.6).toInt(),
-            LODLevel.ULTRA to totalChunks
-        )
-
-        val tempFile = File(context.cacheDir, "$modelName.progressive")
-        RandomAccessFile(tempFile, "rw").use { it.setLength(metadata.totalSize) }
-
-        var currentLod = LODLevel.NONE
-        var downloadedChunks = 0
-
-        Log.d(TAG, "Starting progressive download: $totalChunks chunks")
-
-        // Prioritní pořadí chunků - nejdřív nejdůležitější
-        val chunkPriorities = (0 until totalChunks).map { chunkIndex ->
-            val priority = when {
-                chunkIndex < lodBoundaries[LODLevel.LOW]!! -> 4      // Nejvyšší priorita
-                chunkIndex < lodBoundaries[LODLevel.MEDIUM]!! -> 3
-                chunkIndex < lodBoundaries[LODLevel.HIGH]!! -> 2
-                else -> 1                                             // Nejnižší priorita
-            }
-            chunkIndex to priority
-        }.sortedByDescending { it.second }
-
-        // Stáhni chunky podle priority
-        val jobs = chunkPriorities.map { (chunkIndex, _) ->
-            async {
-                try {
-                    // Stáhni chunk (s retry logikou)
-                    val chunkData = downloadChunkWithRetry(modelName, chunkIndex, metadata)
-
-                    if (chunkData != null) {
-                        // Zapiš do souboru
-                        synchronized(tempFile) {
-                            RandomAccessFile(tempFile, "rw").use { raf ->
-                                raf.seek(chunkIndex.toLong() * metadata.chunkSize)
-                                raf.write(chunkData)
-                            }
-                        }
-
-                        downloadedChunks++
-
-                        // Zkontroluj, zda jsme dosáhli nového LOD levelu
-                        val newLod = determineLODLevel(downloadedChunks, lodBoundaries)
-
-                        if (newLod != currentLod && newLod != LODLevel.NONE) {
-                            currentLod = newLod
-
-                            Log.d(TAG, "Reached LOD level: $currentLod ($downloadedChunks/$totalChunks chunks)")
-
-                            // Notifikuj UI
-                            withContext(Dispatchers.Main) {
-                                onStateChange(
-                                    ProgressiveLoadState(
-                                        lodLevel = currentLod,
-                                        availableChunks = downloadedChunks,
-                                        totalChunks = totalChunks,
-                                        canDisplay = currentLod != LODLevel.NONE,
-                                        modelFile = tempFile,
-                                        loadPercentage = (downloadedChunks.toFloat() / totalChunks) * 100
-                                    )
-                                )
-                            }
-                        }
-
-                        true
-                    } else {
-                        false
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to download chunk $chunkIndex", e)
-                    false
-                }
-            }
-        }
-
-        // Počkej na všechny chunky
-        jobs.awaitAll()
-
-        // Přesuň do finální lokace
-        val finalFile = File(context.filesDir, "models/$modelName")
-        finalFile.parentFile?.mkdirs()
-        tempFile.renameTo(finalFile)
-
-        Log.d(TAG, "Progressive download completed")
-
-        finalFile
-    }
-
-    private suspend fun downloadChunkWithRetry(
-        modelName: String,
-        chunkIndex: Int,
-        metadata: ModelMetadata,
-        retryCount: Int = 0
-    ): ByteArray? = withContext(Dispatchers.IO) {
         try {
-            // Zkus cache
-            val cached = downloader.getCachedChunk(modelName, chunkIndex)
-            if (cached != null) {
-                return@withContext cached
+            // Step 1: Download preview
+            Log.d(TAG, "⏳ Downloading preview: ${modelInfo.previewName}")
+            onStateChange(PreviewLoadResult(
+                state = ProgressiveLoadState.LOADING_PREVIEW,
+                message = "Načítání náhledu..."
+            ))
+
+            val downloadedPreview = downloader.downloadPreview(modelInfo.previewName)
+
+            if (downloadedPreview == null) {
+                Log.e(TAG, "Failed to download preview, falling back")
+                return@withContext null
             }
 
-            // Stáhni nový
-            val url = java.net.URL("${downloader.serverUrl}/download-chunk/$modelName/$chunkIndex")
-            val connection = url.openConnection() as java.net.HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 30000
-            connection.readTimeout = 60000
+            // Step 2: Preview ready - notify UI immediately
+            Log.d(TAG, "✨ Preview ready: ${downloadedPreview.absolutePath}")
+            onStateChange(PreviewLoadResult(
+                state = ProgressiveLoadState.PREVIEW_READY,
+                previewFile = downloadedPreview,
+                previewProgress = 1f,
+                message = "Náhled připraven"
+            ))
 
-            if (connection.responseCode == java.net.HttpURLConnection.HTTP_OK) {
-                val data = connection.inputStream.readBytes()
-                connection.disconnect()
+            // Step 3: Start downloading full model in background
+            Log.d(TAG, "📦 Starting full model download: ${modelInfo.name}")
+            onStateChange(PreviewLoadResult(
+                state = ProgressiveLoadState.LOADING_FULL,
+                previewFile = downloadedPreview,
+                previewProgress = 1f,
+                message = "Stahování plné kvality..."
+            ))
 
-                // Ulož do cache
-                downloader.saveCachedChunk(modelName, chunkIndex, data)
+            val downloadedFull = downloader.downloadModel(modelInfo.name) { progress ->
+                val fullProgress = if (progress.totalBytes > 0) {
+                    progress.downloadedBytes.toFloat() / progress.totalBytes
+                } else 0f
 
-                data
-            } else {
-                connection.disconnect()
-                null
+                onStateChange(PreviewLoadResult(
+                    state = ProgressiveLoadState.LOADING_FULL,
+                    previewFile = downloadedPreview,
+                    previewProgress = 1f,
+                    fullProgress = fullProgress,
+                    message = "Plná kvalita: ${(fullProgress * 100).toInt()}%"
+                ))
             }
+
+            if (downloadedFull == null) {
+                Log.e(TAG, "Failed to download full model, but preview is available")
+                // Return preview file as fallback
+                return@withContext downloadedPreview
+            }
+
+            // Step 4: Full model ready
+            Log.d(TAG, "✅ Full model ready: ${downloadedFull.absolutePath}")
+            onStateChange(PreviewLoadResult(
+                state = ProgressiveLoadState.FULL_READY,
+                previewFile = downloadedPreview,
+                fullFile = downloadedFull,
+                previewProgress = 1f,
+                fullProgress = 1f,
+                message = "Plná kvalita připravena"
+            ))
+
+            downloadedFull
+
+        } catch (e: CancellationException) {
+            Log.d(TAG, "Download cancelled")
+            throw e
         } catch (e: Exception) {
-            if (retryCount < 3) {
-                delay(1000L * (retryCount + 1))
-                downloadChunkWithRetry(modelName, chunkIndex, metadata, retryCount + 1)
-            } else {
-                null
-            }
-        }
-    }
-
-    private fun determineLODLevel(
-        downloadedChunks: Int,
-        boundaries: Map<LODLevel, Int>
-    ): LODLevel {
-        return when {
-            downloadedChunks >= boundaries[LODLevel.ULTRA]!! -> LODLevel.ULTRA
-            downloadedChunks >= boundaries[LODLevel.HIGH]!! -> LODLevel.HIGH
-            downloadedChunks >= boundaries[LODLevel.MEDIUM]!! -> LODLevel.MEDIUM
-            downloadedChunks >= boundaries[LODLevel.LOW]!! -> LODLevel.LOW
-            else -> LODLevel.NONE
+            Log.e(TAG, "Preview download error", e)
+            null
         }
     }
 }
-
-/**
- * Extension pro ParallelModelDownloader - přidává metody pro progressive loader
- */
-fun ParallelModelDownloader.getModelMetadata(modelName: String): ModelMetadata? {
-    // Tato metoda už existuje v ParallelModelDownloader jako private
-    // Buď ji můžete udělat internal, nebo zavolat přes reflection
-    // Pro jednoduchost použijeme variantu se síťovým voláním zde
-    return null // Placeholder - implementace v ParallelModelDownloader
-}
-
-fun ParallelModelDownloader.getCachedChunk(modelName: String, chunkIndex: Int): ByteArray? {
-    // Tato metoda už existuje v ParallelModelDownloader jako private
-    return null // Placeholder
-}
-
-fun ParallelModelDownloader.saveCachedChunk(modelName: String, chunkIndex: Int, data: ByteArray) {
-    // Tato metoda už existuje v ParallelModelDownloader jako private
-}
-
-val ParallelModelDownloader.serverUrl: String
-    get() = "http://192.168.50.96:3000" // Nebo načti z konfigurace

@@ -12,7 +12,11 @@ data class ModelInfo(
     val sizeInMB: Double,
     val modified: String,
     val chunked: Boolean = false,
-    val totalChunks: Int = 0
+    val totalChunks: Int = 0,
+    // Server-side preview support
+    val hasPreview: Boolean = false,
+    val previewName: String? = null,      // e.g., "model_preview.glb"
+    val previewSizeInMB: Double = 0.0
 )
 
 /**
