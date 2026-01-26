@@ -15,6 +15,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.bp.download.DownloadProgress
+import com.example.bp.download.ModelInfo
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -23,7 +25,14 @@ import kotlin.math.roundToInt
 fun ModelScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val downloader = remember { ModelDownloader(context) }
+
+    // 🆕 Použij DownloadManager - nejinteligentnější volba
+    val downloadManager = remember {
+        com.example.bp.download.DownloadManager(context)
+    }
+
+    // Pro kompatibilitu s UI (které očekává některé metody)
+    val downloader = downloadManager
 
     var availableModels by remember { mutableStateOf<List<ModelInfo>>(emptyList()) }
     var selectedModel by remember { mutableStateOf<ModelInfo?>(null) }
@@ -36,6 +45,10 @@ fun ModelScreen() {
     // Nový progress state pro chunked download
     var downloadProgress by remember { mutableStateOf<DownloadProgress?>(null) }
     var cacheSize by remember { mutableStateOf(0L) }
+
+    // 🆕 Network monitoring
+    var showMeteredWarning by remember { mutableStateOf(false) }
+    var pendingDownloadModel by remember { mutableStateOf<ModelInfo?>(null) }
 
     // Načti seznam modelů při startu
     LaunchedEffect(Unit) {
@@ -83,6 +96,69 @@ fun ModelScreen() {
     Column(
         modifier = Modifier.fillMaxSize()
     ) {
+        // 🆕 Metered connection warning dialog
+        if (showMeteredWarning && pendingDownloadModel != null) {
+            AlertDialog(
+                onDismissRequest = {
+                    showMeteredWarning = false
+                    pendingDownloadModel = null
+                },
+                icon = {
+                    Text("⚠️", style = MaterialTheme.typography.displaySmall)
+                },
+                title = { Text("Mobilní data") },
+                text = {
+                    Column {
+                        Text("Stahujete ${pendingDownloadModel!!.sizeInMB} MB přes mobilní data.")
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "Doporučujeme připojit se k WiFi.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        showMeteredWarning = false
+                        val model = pendingDownloadModel!!
+                        pendingDownloadModel = null
+
+                        // Pokračuj ve stahování
+                        scope.launch {
+                            isLoading = true
+                            errorMessage = null
+                            downloadProgress = null
+
+                            val file = downloadManager.downloadModelSmart(model) { progress ->
+                                downloadProgress = progress
+                            }
+
+                            if (file != null) {
+                                downloadedModelPath = file.absolutePath
+                                cacheSize = downloadManager.getCacheSize()
+                            } else {
+                                errorMessage = "Stahování selhalo"
+                            }
+
+                            isLoading = false
+                            downloadProgress = null
+                        }
+                    }) {
+                        Text("Pokračovat")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showMeteredWarning = false
+                        pendingDownloadModel = null
+                    }) {
+                        Text("Zrušit")
+                    }
+                }
+            )
+        }
+
         // Toolbar s tlačítky
         Surface(
             tonalElevation = 3.dp,
@@ -136,18 +212,21 @@ fun ModelScreen() {
                     }
                 }
 
-                // Debug info
+                // Debug info + Download recommendation
                 selectedModel?.let { model ->
-                    if (downloader.isModelDownloaded(model.name)) {
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 8.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.primaryContainer
-                            )
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (downloadManager.isModelDownloaded(model.name))
+                                MaterialTheme.colorScheme.primaryContainer
+                            else
+                                MaterialTheme.colorScheme.secondaryContainer
+                        )
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            if (downloadManager.isModelDownloaded(model.name)) {
                                 Text(
                                     text = "✓ Stažený model",
                                     style = MaterialTheme.typography.labelMedium,
@@ -155,9 +234,22 @@ fun ModelScreen() {
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
                                 Text(
-                                    text = "${model.name} (${downloader.getModelSize(model.name)} MB)",
+                                    text = "${model.name} (${downloadManager.getModelSize(model.name)} MB)",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            } else {
+                                Text(
+                                    text = "📊 Doporučení stahování",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                                )
+                                Text(
+                                    text = downloadManager.getDownloadRecommendation(model),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.padding(top = 4.dp)
                                 )
                             }
                         }
@@ -246,25 +338,32 @@ fun ModelScreen() {
                         onClick = {
                             selectedModel?.let { model ->
                                 scope.launch {
+                                    // Zkontroluj, zda už je stažený
+                                    if (downloader.isModelDownloaded(model.name)) {
+                                        downloadedModelPath = downloader.getModelPath(model.name)
+                                        return@launch
+                                    }
+
+                                    // 🆕 Zkontroluj metered connection
+                                    if (downloadManager.shouldShowMeteredWarning(model)) {
+                                        // Zobraz varování
+                                        pendingDownloadModel = model
+                                        showMeteredWarning = true
+                                        return@launch
+                                    }
+
+                                    // 🆕 Použij inteligentní stahování
                                     isLoading = true
                                     errorMessage = null
                                     downloadProgress = null
 
-                                    // Zkontroluj, zda už je stažený
-                                    if (downloader.isModelDownloaded(model.name)) {
-                                        downloadedModelPath = downloader.getModelPath(model.name)
-                                        isLoading = false
-                                        return@launch
-                                    }
-
-                                    // Stáhni s chunked supportem
-                                    val file = downloader.downloadModelChunked(model.name) { progress ->
+                                    val file = downloadManager.downloadModelSmart(model) { progress ->
                                         downloadProgress = progress
                                     }
 
                                     if (file != null) {
                                         downloadedModelPath = file.absolutePath
-                                        cacheSize = downloader.getCacheSize()
+                                        cacheSize = downloadManager.getCacheSize()
                                     } else {
                                         errorMessage = "Stahování selhalo - zkontrolujte připojení"
                                     }

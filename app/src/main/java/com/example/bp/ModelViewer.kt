@@ -1,6 +1,7 @@
 package com.example.bp
 
 import android.annotation.SuppressLint
+import android.util.Log
 import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.Surface
@@ -45,7 +46,7 @@ fun ModelViewer(
 
     DisposableEffect(Unit) {
         onDispose {
-            android.util.Log.d("ModelViewer", "ModelViewer disposed")
+            Log.d("ModelViewer", "ModelViewer disposed")
         }
     }
 
@@ -88,7 +89,7 @@ fun ModelViewer(
             // Načti model na background threadu
             scope.launch(Dispatchers.Main) {
                 try {
-                    android.util.Log.d("ModelViewer", "Starting model load...")
+                    Log.d("ModelViewer", "Starting model load...")
 
                     // Načti soubor do bufferu na IO threadu
                     val buffer = withContext(Dispatchers.IO) {
@@ -112,11 +113,11 @@ fun ModelViewer(
                                 val maxSize = 200 * 1024 * 1024 // 200 MB limit
 
                                 if (fileSize > maxSize) {
-                                    android.util.Log.e("ModelViewer", "Model je příliš velký: ${fileSize / (1024 * 1024)} MB")
+                                    Log.e("ModelViewer", "Model je příliš velký: ${fileSize / (1024 * 1024)} MB")
                                     throw IllegalArgumentException("Model je příliš velký (max 200 MB)")
                                 }
 
-                                android.util.Log.d("ModelViewer", "Loading model: ${fileSize / (1024 * 1024)} MB")
+                                Log.d("ModelViewer", "Loading model: ${fileSize / (1024 * 1024)} MB")
 
                                 FileInputStream(file).use { inputStream ->
                                     val chunkSize = 1024 * 1024 // 1 MB chunks
@@ -133,7 +134,7 @@ fun ModelViewer(
                                         totalRead += bytesRead
 
                                         if (totalRead % (10 * 1024 * 1024) == 0) {
-                                            android.util.Log.d("ModelViewer", "Loaded: ${totalRead / (1024 * 1024)} MB / ${totalBytes / (1024 * 1024)} MB")
+                                            Log.d("ModelViewer", "Loaded: ${totalRead / (1024 * 1024)} MB / ${totalBytes / (1024 * 1024)} MB")
                                         }
                                     }
 
@@ -145,19 +146,19 @@ fun ModelViewer(
                     }
 
                     // Zpátky na main thread - všechny Filament operace musí být zde
-                    android.util.Log.d("ModelViewer", "Creating asset from buffer...")
+                    Log.d("ModelViewer", "Creating asset from buffer...")
                     val asset = assetLoader.createAsset(buffer)
 
                     asset?.let {
-                        android.util.Log.d("ModelViewer", "Loading resources (this may take a while)...")
+                        Log.d("ModelViewer", "Loading resources (this may take a while)...")
 
                         // Synchronní načtení (musí být na main threadu)
                         resourceLoader.loadResources(it)
 
-                        android.util.Log.d("ModelViewer", "Releasing source data...")
+                        Log.d("ModelViewer", "Releasing source data...")
                         it.releaseSourceData()
 
-                        android.util.Log.d("ModelViewer", "Adding entities to scene...")
+                        Log.d("ModelViewer", "Adding entities to scene...")
                         scene.addEntities(it.entities)
 
                         val c = it.boundingBox.center
@@ -165,12 +166,12 @@ fun ModelViewer(
                         modelCenter[1] = c[1]
                         modelCenter[2] = c[2]
 
-                        android.util.Log.d("ModelViewer", "Model loaded successfully!")
+                        Log.d("ModelViewer", "Model loaded successfully!")
                     }
                 } catch (e: OutOfMemoryError) {
-                    android.util.Log.e("ModelViewer", "Out of memory loading model!", e)
+                    Log.e("ModelViewer", "Out of memory loading model!", e)
                 } catch (e: Exception) {
-                    android.util.Log.e("ModelViewer", "Error loading model", e)
+                    Log.e("ModelViewer", "Error loading model", e)
                     e.printStackTrace()
                 }
             }
