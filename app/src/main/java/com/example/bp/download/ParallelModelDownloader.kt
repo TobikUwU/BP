@@ -429,61 +429,6 @@ class ParallelModelDownloader(private val context: Context) {
     }
 
     // ========================================================================
-    // PREVIEW DOWNLOAD - Simple direct download for small preview files
-    // ========================================================================
-
-    /**
-     * Download a preview file directly (no chunking needed - previews are small)
-     */
-    suspend fun downloadPreview(previewName: String): File? = withContext(Dispatchers.IO) {
-        var connection: HttpURLConnection? = null
-        try {
-            val outputFile = File(modelsDir, previewName)
-
-            // Check if already downloaded
-            if (outputFile.exists() && outputFile.length() > 0) {
-                Log.d(TAG, "Preview already exists: ${outputFile.absolutePath}")
-                return@withContext outputFile
-            }
-
-            val url = URL("$serverUrl/download/$previewName")
-            connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 10000
-            connection.readTimeout = 30000
-            connection.setRequestProperty("Accept-Encoding", "gzip")
-
-            val responseCode = connection.responseCode
-
-            if (responseCode == HttpURLConnection.HTTP_OK) {
-                val contentEncoding = connection.getHeaderField("Content-Encoding")
-                val isGzipped = contentEncoding?.contains("gzip") == true
-
-                val data = if (isGzipped) {
-                    val compressedData = connection.inputStream.use { it.readBytes() }
-                    java.util.zip.GZIPInputStream(
-                        java.io.ByteArrayInputStream(compressedData)
-                    ).use { it.readBytes() }
-                } else {
-                    connection.inputStream.use { it.readBytes() }
-                }
-
-                outputFile.writeBytes(data)
-                Log.d(TAG, "✅ Preview downloaded: ${outputFile.absolutePath} (${data.size / 1024} KB)")
-                outputFile
-            } else {
-                Log.e(TAG, "Preview download HTTP error: $responseCode")
-                null
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Preview download error: ${e.message}", e)
-            null
-        } finally {
-            connection?.disconnect()
-        }
-    }
-
-    // ========================================================================
     // KOMPATIBILNÍ API s původním ModelDownloaderem
     // ========================================================================
 

@@ -18,7 +18,6 @@ import androidx.compose.ui.unit.dp
 import android.util.Log
 import com.example.bp.download.DownloadProgress
 import com.example.bp.download.ModelInfo
-import com.example.bp.download.ProgressiveModelLoader
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -39,6 +38,7 @@ fun ModelScreen() {
     var selectedModel by remember { mutableStateOf<ModelInfo?>(null) }
     var downloadedModelPath by remember { mutableStateOf<String?>(null) }
     var isModelLoading by remember { mutableStateOf(false) }
+    var uiRefreshTrigger by remember { mutableStateOf(0) } // Trigger pro recomposition po smazání
 
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -48,11 +48,6 @@ fun ModelScreen() {
 
     var showMeteredWarning by remember { mutableStateOf(false) }
     var pendingDownloadModel by remember { mutableStateOf<ModelInfo?>(null) }
-
-    // 🆕 Preview-based progressive loading state
-    var previewLoadResult by remember { mutableStateOf<ProgressiveModelLoader.PreviewLoadResult?>(null) }
-    var isProgressiveMode by remember { mutableStateOf(false) }
-    var isShowingPreview by remember { mutableStateOf(false) }  // Track if showing preview vs full model
 
     // Job tracking pro cancellation
     var downloadJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
@@ -104,7 +99,7 @@ fun ModelScreen() {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
 
         if (showMeteredWarning && pendingDownloadModel != null) {
             AlertDialog(
@@ -137,6 +132,7 @@ fun ModelScreen() {
                                 if (file != null) {
                                     downloadedModelPath = file.absolutePath
                                     cacheSize = downloadManager.getCacheSize()
+                                    uiRefreshTrigger++ // Aktualizuj UI po stažení
                                 } else {
                                     errorMessage = "Stahování selhalo"
                                 }
@@ -173,43 +169,18 @@ fun ModelScreen() {
                 ) {
                     Text("3D Model Viewer", style = MaterialTheme.typography.headlineSmall)
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        IconButton(
-                            onClick = {
-                                scope.launch {
-                                    isLoading = true
-                                    availableModels = downloadManager.getAvailableModels()
-                                    cacheSize = downloadManager.getCacheSize()
-                                    isLoading = false
-                                }
-                            },
-                            enabled = !isLoading
-                        ) {
-                            Icon(Icons.Default.Refresh, "Obnovit")
-                        }
-
-                        IconButton(
-                            onClick = {
-                                scope.launch {
-                                    downloadManager.clearCache()
-                                    cacheSize = downloadManager.getCacheSize()
-
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Cache vymazána! Velikost: ${formatBytes(cacheSize)}",
-                                        android.widget.Toast.LENGTH_SHORT
-                                    ).show()
-                                }
-                            },
-                            enabled = !isLoading
-                        ) {
-                            if (cacheSize > 0) {
-                                Badge(containerColor = MaterialTheme.colorScheme.error) {
-                                    Text(formatBytes(cacheSize))
-                                }
+                    IconButton(
+                        onClick = {
+                            scope.launch {
+                                isLoading = true
+                                availableModels = downloadManager.getAvailableModels()
+                                cacheSize = downloadManager.getCacheSize()
+                                isLoading = false
                             }
-                            Icon(Icons.Default.Delete, "Vyčistit cache")
-                        }
+                        },
+                        enabled = !isLoading
+                    ) {
+                        Icon(Icons.Default.Refresh, "Obnovit")
                     }
                 }
 
@@ -289,22 +260,24 @@ fun ModelScreen() {
                 }
 
                 selectedModel?.let { model ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (downloadManager.isModelDownloaded(model.name))
-                                MaterialTheme.colorScheme.primaryContainer
-                            else
-                                MaterialTheme.colorScheme.secondaryContainer
-                        )
-                    ) {
-                        Column(modifier = Modifier.padding(12.dp)) {
-                            if (downloadManager.isModelDownloaded(model.name)) {
-                                Text("✓ Stažený model", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                                Text("${model.name} (${downloadManager.getModelSize(model.name)} MB)", style = MaterialTheme.typography.bodySmall)
-                            } else {
-                                Text("📊 Doporučení stahování", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                                Text(downloadManager.getDownloadRecommendation(model), style = MaterialTheme.typography.bodySmall)
+                    key(model.name, uiRefreshTrigger) {
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (downloadManager.isModelDownloaded(model.name))
+                                    MaterialTheme.colorScheme.primaryContainer
+                                else
+                                    MaterialTheme.colorScheme.secondaryContainer
+                            )
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                if (downloadManager.isModelDownloaded(model.name)) {
+                                    Text("✓ Stažený model", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                                    Text("${model.name} (${downloadManager.getModelSize(model.name)} MB)", style = MaterialTheme.typography.bodySmall)
+                                } else {
+                                    Text("📊 Doporučení stahování", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                                    Text(downloadManager.getDownloadRecommendation(model), style = MaterialTheme.typography.bodySmall)
+                                }
                             }
                         }
                     }
@@ -335,20 +308,50 @@ fun ModelScreen() {
                         availableModels.forEach { model ->
                             DropdownMenuItem(
                                 text = {
-                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(model.name)
                                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                                 Text("${model.sizeInMB} MB", style = MaterialTheme.typography.bodySmall)
-                                                if (model.hasPreview) {
-                                                    Text("👁️ preview", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-                                                } else if (model.chunked) {
+                                                if (model.chunked) {
                                                     Text("⚡ ${model.totalChunks} chunks", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.tertiary)
                                                 }
                                             }
                                         }
-                                        if (downloadManager.isModelDownloaded(model.name)) {
-                                            Icon(Icons.Default.Delete, "Staženo", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                                        // Vždy zobrazuj delete button pokud je model stažený, díky uiRefreshTrigger se aktualizuje
+                                        key(uiRefreshTrigger) {
+                                            if (downloadManager.isModelDownloaded(model.name)) {
+                                                IconButton(
+                                                    onClick = {
+                                                        if (downloadManager.deleteModel(model.name)) {
+                                                            // Pokud je to aktuálně zobrazený model, schovej ho
+                                                            if (downloadedModelPath?.contains(model.name) == true) {
+                                                                downloadedModelPath = null
+                                                            }
+                                                            // Vyvolej recomposition
+                                                            uiRefreshTrigger++
+
+                                                            android.widget.Toast.makeText(
+                                                                context,
+                                                                "Model ${model.name} smazán",
+                                                                android.widget.Toast.LENGTH_SHORT
+                                                            ).show()
+                                                        }
+                                                    },
+                                                    modifier = Modifier.size(32.dp)
+                                                ) {
+                                                    Icon(
+                                                        Icons.Default.Delete,
+                                                        "Smazat",
+                                                        tint = MaterialTheme.colorScheme.error,
+                                                        modifier = Modifier.size(20.dp)
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                 },
@@ -363,7 +366,7 @@ fun ModelScreen() {
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                key(selectedModel?.name, uiRefreshTrigger) {
                     Button(
                         onClick = {
                             selectedModel?.let { model ->
@@ -384,57 +387,17 @@ fun ModelScreen() {
                                         isLoading = true
                                         errorMessage = null
                                         downloadProgress = null
-                                        previewLoadResult = null
-                                        isShowingPreview = false
 
-                                        // 🆕 Rozhodnutí: preview-based progressive nebo normální stahování
-                                        val useProgressive = downloadManager.supportsProgressiveLoading(model)
+                                        val file = downloadManager.downloadModelSmart(model) { progress ->
+                                            downloadProgress = progress
+                                        }
 
-                                        if (useProgressive) {
-                                            Log.d("ModelScreen", "🎨 Using PREVIEW-BASED progressive loading for ${model.name}")
-                                            isProgressiveMode = true
-
-                                            val file = downloadManager.downloadModelProgressive(model) { result ->
-                                                previewLoadResult = result
-
-                                                // When preview is ready, display it immediately
-                                                when (result.state) {
-                                                    ProgressiveModelLoader.ProgressiveLoadState.PREVIEW_READY -> {
-                                                        Log.d("ModelScreen", "✨ Displaying PREVIEW")
-                                                        isShowingPreview = true
-                                                        downloadedModelPath = result.previewFile?.absolutePath
-                                                    }
-                                                    ProgressiveModelLoader.ProgressiveLoadState.FULL_READY -> {
-                                                        Log.d("ModelScreen", "✨ Swapping to FULL model")
-                                                        isShowingPreview = false
-                                                        downloadedModelPath = result.fullFile?.absolutePath
-                                                    }
-                                                    else -> { /* Keep current state */ }
-                                                }
-                                            }
-
-                                            if (file != null) {
-                                                downloadedModelPath = file.absolutePath
-                                                isShowingPreview = false
-                                                cacheSize = downloadManager.getCacheSize()
-                                            } else {
-                                                errorMessage = "Progressive stahování selhalo"
-                                            }
-
+                                        if (file != null) {
+                                            downloadedModelPath = file.absolutePath
+                                            cacheSize = downloadManager.getCacheSize()
+                                            uiRefreshTrigger++ // Aktualizuj UI po stažení
                                         } else {
-                                            Log.d("ModelScreen", "📦 Using NORMAL loading for ${model.name}")
-                                            isProgressiveMode = false
-
-                                            val file = downloadManager.downloadModelSmart(model) { progress ->
-                                                downloadProgress = progress
-                                            }
-
-                                            if (file != null) {
-                                                downloadedModelPath = file.absolutePath
-                                                cacheSize = downloadManager.getCacheSize()
-                                            } else {
-                                                errorMessage = "Stahování selhalo"
-                                            }
+                                            errorMessage = "Stahování selhalo"
                                         }
 
                                     } catch (e: kotlinx.coroutines.CancellationException) {
@@ -445,131 +408,24 @@ fun ModelScreen() {
                                     } finally {
                                         isLoading = false
                                         downloadProgress = null
-                                        previewLoadResult = null
-                                        isProgressiveMode = false
-                                        isShowingPreview = false
                                     }
                                 }
                             }
                         },
                         enabled = selectedModel != null && !isLoading,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        if (isLoading && downloadProgress == null && previewLoadResult == null) {
+                        if (isLoading && downloadProgress == null) {
                             CircularProgressIndicator(modifier = Modifier.size(16.dp), color = MaterialTheme.colorScheme.onPrimary)
                             Spacer(modifier = Modifier.width(8.dp))
                         }
                         Text(if (selectedModel?.name?.let { downloadManager.isModelDownloaded(it) } == true) "Zobrazit model" else "Stáhnout model")
                     }
-
-                    if (selectedModel?.name?.let { downloadManager.isModelDownloaded(it) } == true) {
-                        OutlinedButton(onClick = {
-                            selectedModel?.let { model ->
-                                if (downloadManager.deleteModel(model.name)) {
-                                    if (downloadedModelPath == downloadManager.getModelPath(model.name)) {
-                                        downloadedModelPath = null
-                                    }
-                                }
-                            }
-                        }) {
-                            Icon(Icons.Default.Delete, "Smazat", modifier = Modifier.size(18.dp))
-                        }
-                    }
                 }
 
-                // 🆕 PREVIEW-BASED PROGRESSIVE LOADING UI
+                // DOWNLOAD PROGRESS
                 AnimatedVisibility(
-                    visible = isProgressiveMode && previewLoadResult != null,
-                    enter = fadeIn(),
-                    exit = fadeOut()
-                ) {
-                    previewLoadResult?.let { result ->
-                        Card(
-                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = when(result.state) {
-                                    ProgressiveModelLoader.ProgressiveLoadState.LOADING_PREVIEW -> MaterialTheme.colorScheme.surfaceVariant
-                                    ProgressiveModelLoader.ProgressiveLoadState.PREVIEW_READY -> MaterialTheme.colorScheme.tertiaryContainer
-                                    ProgressiveModelLoader.ProgressiveLoadState.LOADING_FULL -> MaterialTheme.colorScheme.secondaryContainer
-                                    ProgressiveModelLoader.ProgressiveLoadState.FULL_READY -> MaterialTheme.colorScheme.primaryContainer
-                                }
-                            )
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        "🎨 Progressive Loading",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text(
-                                        when(result.state) {
-                                            ProgressiveModelLoader.ProgressiveLoadState.LOADING_PREVIEW -> "Načítání náhledu..."
-                                            ProgressiveModelLoader.ProgressiveLoadState.PREVIEW_READY -> "Náhled připraven"
-                                            ProgressiveModelLoader.ProgressiveLoadState.LOADING_FULL -> "Stahování plné kvality"
-                                            ProgressiveModelLoader.ProgressiveLoadState.FULL_READY -> "Plná kvalita"
-                                        },
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-
-                                Spacer(modifier = Modifier.height(8.dp))
-
-                                // Progress bar - shows full model progress when loading full
-                                val animatedProgress by animateFloatAsState(
-                                    if (result.state == ProgressiveModelLoader.ProgressiveLoadState.LOADING_FULL ||
-                                        result.state == ProgressiveModelLoader.ProgressiveLoadState.FULL_READY) {
-                                        result.fullProgress
-                                    } else {
-                                        result.previewProgress
-                                    },
-                                    label = "progressive"
-                                )
-                                LinearProgressIndicator(
-                                    progress = { animatedProgress },
-                                    modifier = Modifier.fillMaxWidth().height(8.dp)
-                                )
-
-                                Spacer(modifier = Modifier.height(8.dp))
-
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        result.message,
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                    Text(
-                                        "${(animatedProgress * 100).toInt()}%",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                }
-
-                                if (result.state == ProgressiveModelLoader.ProgressiveLoadState.PREVIEW_READY ||
-                                    result.state == ProgressiveModelLoader.ProgressiveLoadState.LOADING_FULL) {
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        "✨ Náhled je viditelný, plná kvalita se stahuje na pozadí...",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // NORMAL DOWNLOAD PROGRESS
-                AnimatedVisibility(
-                    visible = !isProgressiveMode && isLoading && downloadProgress != null,
+                    visible = isLoading && downloadProgress != null,
                     enter = fadeIn(),
                     exit = fadeOut()
                 ) {
@@ -636,41 +492,16 @@ fun ModelScreen() {
             when {
                 downloadedModelPath != null -> {
                     Box(modifier = Modifier.fillMaxSize()) {
-                        // key() forces recomposition when path changes
-                        key(downloadedModelPath) {
-                            ModelViewer(modifier = Modifier.fillMaxSize(), modelSource = ModelSource.FILE, modelPath = downloadedModelPath!!)
-                        }
-
-                        // 🆕 Preview quality overlay - shows when displaying preview while loading full model
-                        if (isShowingPreview && previewLoadResult != null) {
-                            val result = previewLoadResult!!
-                            if (result.state != ProgressiveModelLoader.ProgressiveLoadState.FULL_READY) {
-                                Surface(
-                                    modifier = Modifier.align(Alignment.TopCenter).padding(16.dp),
-                                    color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.95f),
-                                    shape = MaterialTheme.shapes.medium
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(12.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
-                                        Column {
-                                            Text(
-                                                "👁️ Náhled kvality",
-                                                style = MaterialTheme.typography.titleSmall,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Text(
-                                                "Načítání plné kvality... ${(result.fullProgress * 100).toInt()}%",
-                                                style = MaterialTheme.typography.bodySmall
-                                            )
-                                        }
-                                    }
-                                }
+                        // Hot-swap: ModelViewer zůstane, jen se vymění model
+                        ModelViewer(
+                            modifier = Modifier.fillMaxSize(),
+                            modelSource = ModelSource.FILE,
+                            modelPath = downloadedModelPath!!,
+                            onModelLoaded = {
+                                Log.d("ModelScreen", "✅ Model fully loaded in viewer")
+                                isModelLoading = false
                             }
-                        }
+                        )
 
                         if (selectedModel?.sizeInMB ?: 0.0 > 50.0 && isModelLoading) {
                             Surface(
@@ -689,25 +520,16 @@ fun ModelScreen() {
                         }
                     }
 
+                    // Nastavit isModelLoading při změně cesty - callback onModelLoaded ho vypne
                     LaunchedEffect(downloadedModelPath) {
                         isModelLoading = true
-                        kotlinx.coroutines.delay(10000)
-                        isModelLoading = false
                     }
                 }
                 isLoading -> {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
                         CircularProgressIndicator()
                         Text(
-                            when {
-                                previewLoadResult != null -> when(previewLoadResult?.state) {
-                                    ProgressiveModelLoader.ProgressiveLoadState.LOADING_PREVIEW -> "Načítání náhledu..."
-                                    ProgressiveModelLoader.ProgressiveLoadState.LOADING_FULL -> "Stahování plné kvality..."
-                                    else -> "Progressive loading..."
-                                }
-                                downloadProgress != null -> "Stahování..."
-                                else -> "Načítání..."
-                            },
+                            if (downloadProgress != null) "Stahování..." else "Načítání...",
                             style = MaterialTheme.typography.bodyLarge
                         )
                     }

@@ -52,7 +52,10 @@ class ModelDownloader(private val context: Context) {
                         sizeInMB = modelObj.getDouble("sizeInMB"),
                         modified = modelObj.getString("modified"),
                         chunked = modelObj.optBoolean("chunked", false),
-                        totalChunks = modelObj.optInt("totalChunks", 0)
+                        totalChunks = modelObj.optInt("totalChunks", 0),
+                        hasPreview = modelObj.optBoolean("hasPreview", false),
+                        previewName = modelObj.optString("previewName", null),
+                        previewSizeInMB = modelObj.optDouble("previewSizeInMB", 0.0)
                     )
                 )
             }
