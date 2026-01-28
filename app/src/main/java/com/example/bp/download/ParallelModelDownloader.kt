@@ -261,6 +261,7 @@ class ParallelModelDownloader(private val context: Context) {
             try {
                 val request = okhttp3.Request.Builder()
                     .url("$serverUrl/download-chunk/$modelName/$chunkIndex")
+                    // Požádáme o komprimovanou verzi
                     .header("Accept-Encoding", "gzip")
                     .get()
                     .build()
@@ -271,28 +272,37 @@ class ParallelModelDownloader(private val context: Context) {
                         return@withContext null
                     }
 
-                    // OkHttp automaticky dekomprimuje GZIP, pokud server posílá s Content-Encoding: gzip
-                    // Ale server posílá raw .gz soubor, takže musíme dekomprimovat manuálně
-                    val contentEncoding = response.header("Content-Encoding")
-                    val isGzipped = contentEncoding?.contains("gzip") == true
+                    // Zkontroluj, jestli server poslal komprimovaná data
+                    val isCompressed = response.header("X-Chunk-Compressed")?.toBoolean() ?: false
+                    val originalSize = response.header("X-Original-Size")?.toLongOrNull()
+                    val compressedSize = response.header("X-Compressed-Size")?.toLongOrNull()
 
-                    val data = if (isGzipped) {
-                        // Server použil Content-Encoding: gzip - OkHttp automaticky dekomprimuje
-                        val responseBytes = response.body?.bytes() ?: return@withContext null
+                    val data = if (isCompressed) {
+                        // Server poslal GZIP komprimovaný chunk (raw .gz soubor)
+                        // Musíme ho manuálně dekomprimovat
+                        val compressedBytes = response.body?.bytes() ?: return@withContext null
 
-                        val originalSize = response.header("X-Original-Size")?.toLongOrNull()
-                        val compressedSize = response.header("X-Compressed-Size")?.toLongOrNull()
+                        val decompressed = try {
+                            java.util.zip.GZIPInputStream(
+                                java.io.ByteArrayInputStream(compressedBytes)
+                            ).use { gzipStream ->
+                                gzipStream.readBytes()
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Chunk $chunkIndex GZIP decompression failed: ${e.message}")
+                            return@withContext null
+                        }
 
                         if (originalSize != null && compressedSize != null && originalSize > 0) {
                             val savings = ((1 - compressedSize.toFloat() / originalSize) * 100).toInt()
-                            Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: saved ${savings}% bandwidth (${compressedSize / 1024}KB → ${responseBytes.size / 1024}KB)")
+                            Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: saved ${savings}% bandwidth (${compressedSize / 1024}KB → ${decompressed.size / 1024}KB)")
                         }
 
-                        responseBytes
+                        decompressed
                     } else {
                         // Server poslal nekomprimovaná data
                         val responseBytes = response.body?.bytes() ?: return@withContext null
-                        Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: ${responseBytes.size / 1024}KB")
+                        Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: ${responseBytes.size / 1024}KB (uncompressed)")
                         responseBytes
                     }
 

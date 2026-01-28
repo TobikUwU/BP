@@ -44,13 +44,8 @@ private class FilamentState(
     var currentAsset: FilamentAsset? = null
     val modelCenter = FloatArray(3)
 
-    // Async loading state
-    var pendingAsset: FilamentAsset? = null
-    var asyncLoadingStarted = false
-    var onAsyncComplete: (() -> Unit)? = null
-    private var lastResourceCount = 0
-
-    // Queued path - pokud přijde nová cesta během loadingu, uložíme ji sem
+    // Loading state - jen pro queue management
+    var isLoadingAsset = false
     var queuedModelPath: String? = null
     var onQueuedPathReady: ((String) -> Unit)? = null
 
@@ -74,115 +69,6 @@ private class FilamentState(
             modelCenter[2].toDouble(),
             0.0, 1.0, 0.0
         )
-    }
-
-    /**
-     * Začni async loading - volá se jednou
-     */
-    fun beginAsyncLoad(asset: FilamentAsset, onComplete: () -> Unit) {
-        pendingAsset = asset
-        asyncLoadingStarted = true
-        onAsyncComplete = onComplete
-        // Reset counters
-        lastResourceCount = 0
-        asyncUpdateCount = 0
-        stableFrameCount = 0
-        lastEntityCount = 0
-        resourceLoader.asyncBeginLoad(asset)
-        Log.d("ModelViewer", "🔄 Async loading started for ${asset.resourceUris.size} resources")
-    }
-
-    // Počítadlo pro async loading
-    private var asyncUpdateCount = 0
-    private var stableFrameCount = 0
-    private var lastEntityCount = 0
-
-    /**
-     * Aktualizuj async loading - volej každý frame
-     * Vrací true když je loading kompletní
-     */
-    fun updateAsyncLoad(): Boolean {
-        val asset = pendingAsset ?: return false
-        if (!asyncLoadingStarted) return false
-
-        // Posuň loading dopředu
-        resourceLoader.asyncUpdateLoad()
-        asyncUpdateCount++
-
-        // Zkontroluj počet entit s renderables
-        val currentEntityCount = asset.entities.size
-
-        if (currentEntityCount == lastEntityCount) {
-            stableFrameCount++
-        } else {
-            stableFrameCount = 0
-            lastEntityCount = currentEntityCount
-        }
-
-        // Považuj za hotové když:
-        // 1. Máme nějaké entity
-        // 2. Stav se nezměnil po 30 framů (~0.5s při 60fps)
-        // 3. Nebo jsme překročili 300 updatů (~5s)
-        val isComplete = (currentEntityCount > 0 && stableFrameCount > 30) || asyncUpdateCount > 300
-
-        if (isComplete) {
-            Log.d("ModelViewer", "Async loading complete after $asyncUpdateCount updates")
-            finalizeAsyncLoad()
-            return true
-        }
-
-        return false
-    }
-
-    /**
-     * Dokonči async loading - zavolej po dokončení
-     */
-    fun finalizeAsyncLoad() {
-        val asset = pendingAsset
-        val callback = onAsyncComplete
-        val nextPath = queuedModelPath
-        val nextPathCallback = onQueuedPathReady
-
-        // Vždy vyčisti stav
-        asyncLoadingStarted = false
-        pendingAsset = null
-        onAsyncComplete = null
-        queuedModelPath = null
-        onQueuedPathReady = null
-
-        if (asset == null) {
-            Log.e("ModelViewer", "⚠️ finalizeAsyncLoad called but pendingAsset is null")
-            callback?.invoke()
-            // Zpracuj queued path i při chybě
-            if (nextPath != null) {
-                Log.d("ModelViewer", "🔄 Processing queued path after error: $nextPath")
-                nextPathCallback?.invoke(nextPath)
-            }
-            return
-        }
-
-        try {
-            asset.releaseSourceData()
-            swapModel(asset)
-            Log.d("ModelViewer", "✅ Async loading finalized!")
-        } catch (e: Exception) {
-            Log.e("ModelViewer", "Error in finalizeAsyncLoad", e)
-        } finally {
-            callback?.invoke()
-            // Zpracuj queued path - načti další model pokud čeká
-            if (nextPath != null) {
-                Log.d("ModelViewer", "🔄 Processing queued path: $nextPath")
-                nextPathCallback?.invoke(nextPath)
-            }
-        }
-    }
-
-    /**
-     * Načti resources synchronně (fallback)
-     */
-    fun loadResourcesSync(asset: FilamentAsset) {
-        resourceLoader.loadResources(asset)
-        asset.releaseSourceData()
     }
 
     /**
@@ -232,93 +118,135 @@ fun ModelViewer(
     var filamentState by remember { mutableStateOf<FilamentState?>(null) }
 
     // Funkce pro načtení modelu - může být volána přímo nebo z queue
-    suspend fun loadModel(pathToLoad: String, state: FilamentState) {
+    fun loadModel(pathToLoad: String, state: FilamentState) {
         Log.d("ModelViewer", "🔄 Hot-swap: loading new model: $pathToLoad")
 
-        try {
-            // Načti soubor do bufferu na IO threadu
-            val buffer = withContext(Dispatchers.IO) {
-                when (modelSource) {
-                    ModelSource.ASSETS -> {
-                        context.assets.open(pathToLoad).use { inputStream ->
-                            val bytes = inputStream.readBytes()
-                            ByteBuffer.allocateDirect(bytes.size)
-                                .order(ByteOrder.nativeOrder())
-                                .put(bytes)
-                                .flip() as ByteBuffer
+        // Launch coroutine pouze pro IO operaci (čtení souboru)
+        scope.launch {
+            try {
+                // Pouze čtení souboru na IO threadu
+                val buffer = withContext(Dispatchers.IO) {
+                    when (modelSource) {
+                        ModelSource.ASSETS -> {
+                            context.assets.open(pathToLoad).use { inputStream ->
+                                val bytes = inputStream.readBytes()
+                                ByteBuffer.allocateDirect(bytes.size)
+                                    .order(ByteOrder.nativeOrder())
+                                    .put(bytes)
+                                    .flip() as ByteBuffer
+                            }
                         }
-                    }
-                    ModelSource.FILE -> {
-                        val file = File(pathToLoad)
-                        if (!file.exists()) {
-                            throw IllegalArgumentException("Model soubor neexistuje: $pathToLoad")
-                        }
-
-                        val fileSize = file.length()
-                        val maxSize = 200 * 1024 * 1024 // 200 MB limit
-
-                        if (fileSize > maxSize) {
-                            Log.e("ModelViewer", "Model je příliš velký: ${fileSize / (1024 * 1024)} MB")
-                            throw IllegalArgumentException("Model je příliš velký (max 200 MB)")
-                        }
-
-                        Log.d("ModelViewer", "Loading model from file: ${fileSize / (1024 * 1024)} MB")
-
-                        FileInputStream(file).use { inputStream ->
-                            val chunkSize = 1024 * 1024 // 1 MB chunks
-                            val totalBytes = fileSize.toInt()
-                            val buffer = ByteBuffer.allocateDirect(totalBytes)
-                                .order(ByteOrder.nativeOrder())
-
-                            val chunk = ByteArray(chunkSize)
-                            var bytesRead: Int
-                            var totalRead = 0
-
-                            while (inputStream.read(chunk).also { bytesRead = it } != -1) {
-                                buffer.put(chunk, 0, bytesRead)
-                                totalRead += bytesRead
-
-                                if (totalRead % (10 * 1024 * 1024) == 0) {
-                                    Log.d("ModelViewer", "Buffer loaded: ${totalRead / (1024 * 1024)} MB / ${totalBytes / (1024 * 1024)} MB")
-                                }
+                        ModelSource.FILE -> {
+                            val file = File(pathToLoad)
+                            if (!file.exists()) {
+                                throw IllegalArgumentException("Model soubor neexistuje: $pathToLoad")
                             }
 
-                            buffer.flip()
-                            buffer
+                            val fileSize = file.length()
+                            val maxSize = 200 * 1024 * 1024 // 200 MB limit
+
+                            if (fileSize > maxSize) {
+                                Log.e("ModelViewer", "Model je příliš velký: ${fileSize / (1024 * 1024)} MB")
+                                throw IllegalArgumentException("Model je příliš velký (max 200 MB)")
+                            }
+
+                            Log.d("ModelViewer", "Loading model from file: ${fileSize / (1024 * 1024)} MB")
+
+                            FileInputStream(file).use { inputStream ->
+                                val chunkSize = 1024 * 1024 // 1 MB chunks
+                                val totalBytes = fileSize.toInt()
+                                val buffer = ByteBuffer.allocateDirect(totalBytes)
+                                    .order(ByteOrder.nativeOrder())
+
+                                val chunk = ByteArray(chunkSize)
+                                var bytesRead: Int
+                                var totalRead = 0
+
+                                while (inputStream.read(chunk).also { bytesRead = it } != -1) {
+                                    buffer.put(chunk, 0, bytesRead)
+                                    totalRead += bytesRead
+
+                                    if (totalRead % (10 * 1024 * 1024) == 0) {
+                                        Log.d("ModelViewer", "Buffer loaded: ${totalRead / (1024 * 1024)} MB / ${totalBytes / (1024 * 1024)} MB")
+                                    }
+                                }
+
+                                buffer.flip()
+                                buffer
+                            }
                         }
                     }
                 }
-            }
 
-            // Zpátky na main thread - všechny Filament operace musí být zde
-            withContext(Dispatchers.Main) {
+                // Filament operace běží na main threadu (už jsme tam po withContext)
+                // NENÍ potřeba withContext(Dispatchers.Main) - už jsme na main threadu!
                 Log.d("ModelViewer", "Creating asset from buffer...")
                 val asset = state.assetLoader.createAsset(buffer)
 
                 asset?.let {
-                    // Spusť async loading
-                    state.beginAsyncLoad(it) {
+                    val resourceCount = it.resourceUris.size
+
+                    if (resourceCount == 0) {
+                        // Model nemá žádné externí resources - načti okamžitě
+                        Log.d("ModelViewer", "✅ No external resources - loading synchronously")
+                        state.resourceLoader.loadResources(it)
+                        it.releaseSourceData()
+                        state.swapModel(it)
                         loadedPath = pathToLoad
                         isLoading = false
+                        state.isLoadingAsset = false
                         Log.d("ModelViewer", "✅ Model loaded and swapped: $pathToLoad")
                         onModelLoaded?.invoke()
+
+                        // Zpracuj queued path
+                        val nextPath = state.queuedModelPath
+                        if (nextPath != null) {
+                            state.queuedModelPath = null
+                            val callback = state.onQueuedPathReady
+                            state.onQueuedPathReady = null
+                            callback?.invoke(nextPath)
+                        }
+                    } else {
+                        // Model má textury/resources - spusť async loading
+                        Log.d("ModelViewer", "🔄 Loading $resourceCount external resources asynchronously")
+                        state.resourceLoader.asyncBeginLoad(it)
+                        state.isLoadingAsset = true
+
+                        // Swap model okamžitě - textury se načtou postupně
+                        it.releaseSourceData()
+                        state.swapModel(it)
+                        loadedPath = pathToLoad
+                        isLoading = false
+                        state.isLoadingAsset = false
+                        Log.d("ModelViewer", "✅ Model swapped, textures loading in background: $pathToLoad")
+                        onModelLoaded?.invoke()
+
+                        // Zpracuj queued path
+                        val nextPath = state.queuedModelPath
+                        if (nextPath != null) {
+                            state.queuedModelPath = null
+                            val callback = state.onQueuedPathReady
+                            state.onQueuedPathReady = null
+                            callback?.invoke(nextPath)
+                        }
                     }
                 } ?: run {
                     isLoading = false
+                    state.isLoadingAsset = false
                     Log.e("ModelViewer", "Failed to create asset from buffer")
                 }
+            } catch (e: OutOfMemoryError) {
+                Log.e("ModelViewer", "Out of memory loading model!", e)
+                isLoading = false
+            } catch (e: CancellationException) {
+                Log.d("ModelViewer", "Model loading cancelled")
+                isLoading = false
+                throw e
+            } catch (e: Exception) {
+                Log.e("ModelViewer", "Error loading model", e)
+                e.printStackTrace()
+                isLoading = false
             }
-        } catch (e: OutOfMemoryError) {
-            Log.e("ModelViewer", "Out of memory loading model!", e)
-            isLoading = false
-        } catch (e: CancellationException) {
-            Log.d("ModelViewer", "Model loading cancelled")
-            isLoading = false
-            throw e
-        } catch (e: Exception) {
-            Log.e("ModelViewer", "Error loading model", e)
-            e.printStackTrace()
-            isLoading = false
         }
     }
 
@@ -330,17 +258,14 @@ fun ModelViewer(
         if (modelPath == loadedPath) return@LaunchedEffect
 
         // Pokud už něco načítáme, zařaď do fronty
-        if (isLoading || state.asyncLoadingStarted) {
+        if (isLoading || state.isLoadingAsset) {
             Log.d("ModelViewer", "⏳ Loading in progress, queueing: $modelPath")
             state.queuedModelPath = modelPath
             state.onQueuedPathReady = { queuedPath ->
                 // Toto se zavolá po dokončení aktuálního loadingu
-                // Spustíme nový load ve scope vázaném na composable
-                scope.launch {
-                    if (queuedPath != loadedPath) {
-                        isLoading = true
-                        loadModel(queuedPath, state)
-                    }
+                if (queuedPath != loadedPath) {
+                    isLoading = true
+                    loadModel(queuedPath, state)
                 }
             }
             return@LaunchedEffect
@@ -468,8 +393,8 @@ fun ModelViewer(
 
                     val frameCallback = object : Choreographer.FrameCallback {
                         override fun doFrame(frameTimeNanos: Long) {
-                            // Aktualizuj async loading pokud probíhá
-                            state.updateAsyncLoad()
+                            // Async loading běží v Filament's vlastních threadech
+                            // Není třeba manuálně updateovat
 
                             if (surfaceView.height > 0) {
                                 val aspect = surfaceView.width.toDouble() / surfaceView.height
