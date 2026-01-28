@@ -67,6 +67,12 @@ dependencies {
     implementation("com.google.android.filament:filament-utils-android:$filamentVersion")
     implementation("com.google.android.filament:filamat-android:$filamentVersion")
 
+    // JSON serialization pro persistence
+    implementation("com.google.code.gson:gson:2.10.1")
+    
+    // OkHttp pro HTTP/2 support
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

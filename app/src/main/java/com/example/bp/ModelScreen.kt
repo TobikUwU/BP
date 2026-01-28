@@ -63,6 +63,9 @@ fun ModelScreen() {
         isLoading = true
         errorMessage = null
         try {
+            // Inicializuj download manager
+            downloadManager.initialize()
+
             availableModels = downloadManager.getAvailableModels()
             cacheSize = downloadManager.getCacheSize()
             if (availableModels.isEmpty()) {
@@ -74,6 +77,9 @@ fun ModelScreen() {
             isLoading = false
         }
     }
+
+    // Observe paused downloads
+    val pausedDownloads by downloadManager.pausedDownloads.collectAsState()
 
     fun formatBytes(bytes: Long): String {
         return when {
@@ -244,6 +250,7 @@ fun ModelScreen() {
 
                             Spacer(modifier = Modifier.height(8.dp))
                             val networkStats = downloadManager.getNetworkStats()
+                            val http2Stats = com.example.bp.download.Http2ClientManager.getConnectionStats()
                             Text(
                                 """
                                 Network Info:
@@ -251,6 +258,9 @@ fun ModelScreen() {
                                 Speed: ${networkStats.averageSpeed / 1024} KB/s
                                 Recommended: ${networkStats.recommendedParallelism}
                                 Metered: ${networkStats.isMetered}
+
+                                HTTP/2 Connection Pool:
+                                $http2Stats
                                 """.trimIndent(),
                                 style = MaterialTheme.typography.bodySmall,
                                 fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
@@ -470,6 +480,146 @@ fun ModelScreen() {
                                             Text("⏱️ Zbývá:", style = MaterialTheme.typography.bodySmall)
                                             Text(formatTime(progress.eta), style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium)
                                         }
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                // Pause/Resume/Cancel buttons
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            selectedModel?.let { model ->
+                                                scope.launch {
+                                                    downloadJob?.cancel()
+                                                    downloadManager.pauseDownload(model.name)
+                                                    isLoading = false
+                                                    downloadProgress = null
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("⏸ Pozastavit")
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            selectedModel?.let { model ->
+                                                scope.launch {
+                                                    downloadJob?.cancel()
+                                                    downloadManager.cancelDownload(model.name)
+                                                    isLoading = false
+                                                    downloadProgress = null
+                                                    uiRefreshTrigger++
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                        colors = ButtonDefaults.outlinedButtonColors(
+                                            contentColor = MaterialTheme.colorScheme.error
+                                        )
+                                    ) {
+                                        Text("✕ Zrušit")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // PAUSED DOWNLOADS
+                if (pausedDownloads.isNotEmpty()) {
+                    Text(
+                        "Pozastavená stahování",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+
+                    pausedDownloads.forEach { pausedDownload ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            pausedDownload.modelName,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        val progressPercent = ((pausedDownload.downloadedBytes.toFloat() / pausedDownload.totalBytes) * 100).roundToInt()
+                                        Text(
+                                            "$progressPercent% dokončeno (${pausedDownload.completedChunks.size}/${pausedDownload.totalChunks} chunks)",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            scope.launch {
+                                                isLoading = true
+                                                errorMessage = null
+                                                downloadProgress = null
+                                                selectedModel = ModelInfo(
+                                                    pausedDownload.modelName,
+                                                    0.0,
+                                                    "",
+                                                    false,
+                                                    0
+                                                )
+
+                                                val file = downloadManager.resumeDownload(pausedDownload.modelName) { progress ->
+                                                    downloadProgress = progress
+                                                }
+
+                                                if (file != null) {
+                                                    downloadedModelPath = file.absolutePath
+                                                    cacheSize = downloadManager.getCacheSize()
+                                                    uiRefreshTrigger++
+                                                } else {
+                                                    errorMessage = "Obnovení selhalo"
+                                                }
+
+                                                isLoading = false
+                                                downloadProgress = null
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                        enabled = !isLoading
+                                    ) {
+                                        Text("▶ Pokračovat")
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            scope.launch {
+                                                downloadManager.cancelDownload(pausedDownload.modelName)
+                                                uiRefreshTrigger++
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                        colors = ButtonDefaults.outlinedButtonColors(
+                                            contentColor = MaterialTheme.colorScheme.error
+                                        )
+                                    ) {
+                                        Text("✕ Zrušit")
                                     }
                                 }
                             }

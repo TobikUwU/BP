@@ -15,53 +15,62 @@ import java.net.URL
 /**
  * Původní ModelDownloader - zachován pro kompatibilitu
  * Pro nové projekty použijte ParallelModelDownloader nebo DownloadManager
+ * Aktualizováno pro HTTP/2 support
  */
 class ModelDownloader(private val context: Context) {
 
-    private val serverUrl = "http://192.168.50.96:3000"
+    // HTTP/2 server URL (HTTPS na portu 3443)
+    private val serverUrl = "https://192.168.50.96:3443"
+
+    // HTTP/2 klient
+    private val httpClient = com.example.bp.download.Http2ClientManager.client
 
     companion object {
         private const val TAG = "ModelDownloader"
     }
 
     /**
-     * Stáhne seznam dostupných modelů ze serveru
+     * Stáhne seznam dostupných modelů ze serveru (HTTP/2)
      */
     suspend fun getAvailableModels(): List<ModelInfo> = withContext(Dispatchers.IO) {
         try {
-            val url = URL("$serverUrl/models")
-            val connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 5000
-            connection.readTimeout = 5000
+            val request = okhttp3.Request.Builder()
+                .url("$serverUrl/models")
+                .get()
+                .build()
 
-            val response = connection.inputStream.bufferedReader().readText()
-            connection.disconnect()
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.e(TAG, "Failed to get models: ${response.code}")
+                    return@withContext emptyList()
+                }
 
-            Log.d(TAG, "Server response: $response")
+                val responseBody = response.body?.string() ?: return@withContext emptyList()
+                Log.d(TAG, "Models retrieved via ${response.protocol}")
 
-            val jsonResponse = JSONObject(response)
-            val modelsArray = jsonResponse.getJSONArray("models")
+                val jsonResponse = JSONObject(responseBody)
+                val modelsArray = jsonResponse.getJSONArray("models")
 
-            val models = mutableListOf<ModelInfo>()
-            for (i in 0 until modelsArray.length()) {
-                val modelObj = modelsArray.getJSONObject(i)
-                models.add(
-                    ModelInfo(
-                        name = modelObj.getString("name"),
-                        sizeInMB = modelObj.getDouble("sizeInMB"),
-                        modified = modelObj.getString("modified"),
-                        chunked = modelObj.optBoolean("chunked", false),
-                        totalChunks = modelObj.optInt("totalChunks", 0),
-                        hasPreview = modelObj.optBoolean("hasPreview", false),
-                        previewName = modelObj.optString("previewName", null),
-                        previewSizeInMB = modelObj.optDouble("previewSizeInMB", 0.0)
+                val models = mutableListOf<ModelInfo>()
+                for (i in 0 until modelsArray.length()) {
+                    val modelObj = modelsArray.getJSONObject(i)
+                    models.add(
+                        ModelInfo(
+                            name = modelObj.getString("name"),
+                            sizeInMB = modelObj.getDouble("sizeInMB"),
+                            modified = modelObj.getString("modified"),
+                            chunked = modelObj.optBoolean("chunked", false),
+                            totalChunks = modelObj.optInt("totalChunks", 0),
+                            hasPreview = modelObj.optBoolean("hasPreview", false),
+                            previewName = modelObj.optString("previewName", null),
+                            previewSizeInMB = modelObj.optDouble("previewSizeInMB", 0.0)
+                        )
                     )
-                )
-            }
+                }
 
-            Log.d(TAG, "Parsed ${models.size} models")
-            models
+                Log.d(TAG, "Parsed ${models.size} models")
+                models
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error getting models list", e)
             emptyList()
@@ -70,7 +79,7 @@ class ModelDownloader(private val context: Context) {
 
     /**
      * Stáhne model ze serveru a uloží ho do interního úložiště
-     * S progress reportingem pro velké soubory
+     * S progress reportingem pro velké soubory (HTTP/2)
      */
     suspend fun downloadModel(
         modelName: String,
@@ -79,70 +88,69 @@ class ModelDownloader(private val context: Context) {
         try {
             Log.d(TAG, "Starting download: $modelName")
 
-            val url = URL("$serverUrl/download-model/$modelName")
-            val connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 60000
-            connection.readTimeout = 120000
+            val request = okhttp3.Request.Builder()
+                .url("$serverUrl/download-model/$modelName")
+                .get()
+                .build()
 
-            if (connection.responseCode != HttpURLConnection.HTTP_OK) {
-                Log.e(TAG, "Server returned code: ${connection.responseCode}")
-                connection.disconnect()
-                return@withContext null
-            }
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.e(TAG, "Server returned code: ${response.code}")
+                    return@withContext null
+                }
 
-            val totalSize = connection.contentLength.toLong()
-            Log.d(TAG, "Total size: ${totalSize / (1024 * 1024)} MB")
+                val totalSize = response.body?.contentLength() ?: 0L
+                Log.d(TAG, "Total size: ${totalSize / (1024 * 1024)} MB via ${response.protocol}")
 
-            val modelsDir = File(context.filesDir, "models")
-            if (!modelsDir.exists()) {
-                modelsDir.mkdirs()
-            }
+                val modelsDir = File(context.filesDir, "models")
+                if (!modelsDir.exists()) {
+                    modelsDir.mkdirs()
+                }
 
-            val outputFile = File(modelsDir, modelName)
+                val outputFile = File(modelsDir, modelName)
 
-            var downloadedSize = 0L
-            var lastProgressTime = System.currentTimeMillis()
-            var lastDownloadedSize = 0L
-            val buffer = ByteArray(8192)
+                var downloadedSize = 0L
+                var lastProgressTime = System.currentTimeMillis()
+                var lastDownloadedSize = 0L
+                val buffer = ByteArray(8192)
 
-            connection.inputStream.use { input ->
-                FileOutputStream(outputFile).use { output ->
-                    var bytesRead: Int
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                        downloadedSize += bytesRead
+                response.body?.byteStream()?.use { input ->
+                    FileOutputStream(outputFile).use { output ->
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            downloadedSize += bytesRead
 
-                        val currentTime = System.currentTimeMillis()
-                        val timeDiff = currentTime - lastProgressTime
+                            val currentTime = System.currentTimeMillis()
+                            val timeDiff = currentTime - lastProgressTime
 
-                        if (timeDiff > 500) {
-                            val bytesDiff = downloadedSize - lastDownloadedSize
-                            val speed = (bytesDiff * 1000) / timeDiff
-                            val remainingBytes = totalSize - downloadedSize
-                            val eta = if (speed > 0) remainingBytes / speed else 0
+                            if (timeDiff > 500) {
+                                val bytesDiff = downloadedSize - lastDownloadedSize
+                                val speed = (bytesDiff * 1000) / timeDiff
+                                val remainingBytes = totalSize - downloadedSize
+                                val eta = if (speed > 0) remainingBytes / speed else 0
 
-                            onProgress?.invoke(
-                                DownloadProgress(
-                                    downloadedChunks = 0,
-                                    totalChunks = 0,
-                                    downloadedBytes = downloadedSize,
-                                    totalBytes = totalSize,
-                                    currentSpeed = speed,
-                                    eta = eta
+                                onProgress?.invoke(
+                                    DownloadProgress(
+                                        downloadedChunks = 0,
+                                        totalChunks = 0,
+                                        downloadedBytes = downloadedSize,
+                                        totalBytes = totalSize,
+                                        currentSpeed = speed,
+                                        eta = eta
+                                    )
                                 )
-                            )
 
-                            lastProgressTime = currentTime
-                            lastDownloadedSize = downloadedSize
+                                lastProgressTime = currentTime
+                                lastDownloadedSize = downloadedSize
+                            }
                         }
                     }
                 }
-            }
 
-            connection.disconnect()
-            Log.d(TAG, "Download completed: ${outputFile.absolutePath}")
-            outputFile
+                Log.d(TAG, "Download completed: ${outputFile.absolutePath}")
+                outputFile
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error downloading model", e)
             null

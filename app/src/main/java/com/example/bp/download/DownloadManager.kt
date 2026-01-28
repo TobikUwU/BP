@@ -13,6 +13,7 @@ class DownloadManager(private val context: Context) {
 
     private val parallelDownloader = ParallelModelDownloader(context)
     private val bandwidthMonitor = BandwidthMonitor(context)
+    private val downloadStateManager = DownloadStateManager(context)
 
     // 🆕 DEBUG FLAGS
     var debugForceParallel = false
@@ -25,6 +26,10 @@ class DownloadManager(private val context: Context) {
     // Current download state
     private val _currentDownload = MutableStateFlow<DownloadState?>(null)
     val currentDownload: StateFlow<DownloadState?> = _currentDownload.asStateFlow()
+
+    // Paused downloads
+    private val _pausedDownloads = MutableStateFlow<List<DownloadStateManager.DownloadStateData>>(emptyList())
+    val pausedDownloads: StateFlow<List<DownloadStateManager.DownloadStateData>> = _pausedDownloads.asStateFlow()
 
     data class QueuedDownload(
         val modelName: String,
@@ -304,5 +309,127 @@ class DownloadManager(private val context: Context) {
 
     fun getNetworkStats(): BandwidthMonitor.NetworkStats {
         return bandwidthMonitor.networkStats.value
+    }
+
+    // ========================================================================
+    // PAUSE/RESUME/CANCEL
+    // ========================================================================
+
+    /**
+     * Pozastaví aktivní download
+     */
+    suspend fun pauseDownload(modelName: String): Boolean {
+        return try {
+            val success = parallelDownloader.pauseDownload(modelName)
+            if (success) {
+                _currentDownload.value = null
+                refreshPausedDownloads()
+            }
+            success
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to pause download", e)
+            false
+        }
+    }
+
+    /**
+     * Pokračuje v pozastaveném downloadu
+     */
+    suspend fun resumeDownload(
+        modelName: String,
+        onProgress: ((DownloadProgress) -> Unit)? = null
+    ): File? {
+        return try {
+            _currentDownload.value = DownloadState.Preparing(modelName)
+
+            val file = parallelDownloader.resumeDownload(modelName) { progress ->
+                _currentDownload.value = DownloadState.Downloading(modelName, progress)
+                onProgress?.invoke(progress)
+            }
+
+            if (file != null) {
+                _currentDownload.value = DownloadState.Completed(modelName, file)
+                refreshPausedDownloads()
+            } else {
+                _currentDownload.value = DownloadState.Failed(modelName, "Resume failed")
+            }
+
+            file
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to resume download", e)
+            _currentDownload.value = DownloadState.Failed(modelName, e.message ?: "Unknown error")
+            null
+        }
+    }
+
+    /**
+     * Zruší download a smaže vše
+     */
+    suspend fun cancelDownload(modelName: String): Boolean {
+        return try {
+            val success = parallelDownloader.cancelDownload(modelName)
+            if (success) {
+                _currentDownload.value = null
+                refreshPausedDownloads()
+            }
+            success
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to cancel download", e)
+            false
+        }
+    }
+
+    /**
+     * Získá seznam pausnutých downloadů
+     */
+    fun getPausedDownloads(): List<DownloadStateManager.DownloadStateData> {
+        return downloadStateManager.getAllPendingDownloads().filter { it.isPaused }
+    }
+
+    /**
+     * Automaticky obnoví všechny pausnuté downloady při startu
+     */
+    suspend fun autoResumeDownloads(): Int {
+        return try {
+            val pausedDownloads = getPausedDownloads()
+            var resumedCount = 0
+
+            pausedDownloads.forEach { download ->
+                if (parallelDownloader.canResumeDownload(download.modelName)) {
+                    // Spustí download service pro automatické resume
+                    DownloadService.resumeDownload(context, download.modelName)
+                    resumedCount++
+                }
+            }
+
+            refreshPausedDownloads()
+            Log.d(TAG, "Auto-resumed $resumedCount downloads")
+            resumedCount
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to auto-resume downloads", e)
+            0
+        }
+    }
+
+    /**
+     * Kontroluje, zda lze download obnovit
+     */
+    fun canResumeDownload(modelName: String): Boolean {
+        return parallelDownloader.canResumeDownload(modelName)
+    }
+
+    /**
+     * Refresh seznam pausnutých downloadů
+     */
+    private fun refreshPausedDownloads() {
+        _pausedDownloads.value = getPausedDownloads()
+    }
+
+    /**
+     * Inicializace při startu - načte pausnuté downloady
+     */
+    fun initialize() {
+        refreshPausedDownloads()
+        downloadStateManager.cleanupOldDownloads()
     }
 }

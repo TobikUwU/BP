@@ -22,15 +22,25 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class ParallelModelDownloader(private val context: Context) {
 
-    private val serverUrl = "http://192.168.50.96:3000"
+    // HTTP/2 server URL (HTTPS na portu 3443)
+    private val serverUrl = "https://192.168.50.96:3443"
     private val cacheDir = File(context.cacheDir, "model_chunks")
     private val modelsDir = File(context.filesDir, "models")
+
+    // HTTP/2 klient
+    private val httpClient = Http2ClientManager.chunkClient
 
     // Fallback na původní downloader
     private val fallbackDownloader = ModelDownloader(context)
 
     // Bandwidth monitor
     private val bandwidthMonitor = BandwidthMonitor(context)
+
+    // Download state manager pro persistence
+    private val downloadStateManager = DownloadStateManager(context)
+
+    // Active jobs tracking pro pause/resume
+    private val activeJobs = ConcurrentHashMap<String, Job>()
 
     // Konfigurace
     private var maxParallelDownloads = 3  // Default, bude se měnit podle rychlosti
@@ -103,103 +113,32 @@ class ParallelModelDownloader(private val context: Context) {
         metadata: ModelMetadata,
         onProgress: ((DownloadProgress) -> Unit)?
     ): File? = withContext(Dispatchers.IO) {
-        val outputFile = File(modelsDir, modelName)
+        // Zkontroluj, zda existuje uložený stav
+        val existingState = downloadStateManager.getDownloadState(modelName)
+
+        // Pokud existuje uložený stav a je platný, pokračuj
+        if (existingState != null && downloadStateManager.verifyTmpFile(existingState)) {
+            Log.d(TAG, "Found existing download state, resuming...")
+            return@withContext downloadModelWithCheckpoint(modelName, metadata, onProgress, existingState)
+        }
+
+        // Jinak začni nový download
         val tempFile = File(modelsDir, "$modelName.tmp")
 
-        // Vytvoř prázdný soubor
-        RandomAccessFile(tempFile, "rw").use { it.setLength(metadata.totalSize) }
+        // Uložit počáteční checkpoint
+        downloadStateManager.saveDownloadState(
+            modelName = modelName,
+            completedChunks = emptySet(),
+            totalChunks = metadata.totalChunks,
+            downloadedBytes = 0,
+            totalBytes = metadata.totalSize,
+            isPaused = false,
+            metadata = metadata,
+            tmpFilePath = tempFile.absolutePath
+        )
 
-        // Progress tracking
-        val downloadedChunks = AtomicInteger(0)
-        val downloadedBytes = AtomicLong(0)
-        val failedChunks = ConcurrentHashMap<Int, Int>()
-        var lastProgressTime = System.currentTimeMillis()
-        var lastDownloadedBytes = 0L
-
-        // Semafora pro omezení paralelních stahování
-        val semaphore = Semaphore(maxParallelDownloads)
-
-        // Stáhni všechny chunky paralelně
-        val jobs = (0 until metadata.totalChunks).map { chunkIndex ->
-            async {
-                semaphore.withPermit {
-                    val startTime = System.currentTimeMillis()
-
-                    downloadChunkWithRetry(
-                        modelName,
-                        chunkIndex,
-                        metadata,
-                        tempFile
-                    )?.also { chunkSize ->
-                        downloadedChunks.incrementAndGet()
-                        downloadedBytes.addAndGet(chunkSize.toLong())
-
-                        // Vypočti rychlost pro bandwidth monitor
-                        val elapsed = System.currentTimeMillis() - startTime
-                        if (elapsed > 0) {
-                            val speed = (chunkSize * 1000L) / elapsed
-                            bandwidthMonitor.updateSpeed(speed)
-                        }
-
-                        // Update progress
-                        val currentTime = System.currentTimeMillis()
-                        val timeDiff = currentTime - lastProgressTime
-
-                        if (timeDiff > 300) {
-                            val currentBytes = downloadedBytes.get()
-                            val bytesDiff = currentBytes - lastDownloadedBytes
-                            val speed = if (timeDiff > 0) (bytesDiff * 1000) / timeDiff else 0
-                            val remainingBytes = metadata.totalSize - currentBytes
-                            val eta = if (speed > 0) remainingBytes / speed else 0
-
-                            onProgress?.invoke(
-                                DownloadProgress(
-                                    downloadedChunks = downloadedChunks.get(),
-                                    totalChunks = metadata.totalChunks,
-                                    downloadedBytes = currentBytes,
-                                    totalBytes = metadata.totalSize,
-                                    currentSpeed = speed,
-                                    eta = eta
-                                )
-                            )
-
-                            lastProgressTime = currentTime
-                            lastDownloadedBytes = currentBytes
-                        }
-                    } ?: run {
-                        failedChunks[chunkIndex] = (failedChunks[chunkIndex] ?: 0) + 1
-                        null
-                    }
-                }
-            }
-        }
-
-        // Počkej na všechny
-        jobs.awaitAll()
-
-        // Zkontroluj chyby
-        if (failedChunks.isNotEmpty()) {
-            Log.e(TAG, "Failed chunks: ${failedChunks.keys}")
-            tempFile.delete()
-            return@withContext null
-        }
-
-        // Ověř hash
-        Log.d(TAG, "Verifying integrity...")
-        val fileHash = calculateFileHash(tempFile)
-
-        if (fileHash != metadata.fileHash) {
-            Log.e(TAG, "Hash mismatch!")
-            tempFile.delete()
-            return@withContext null
-        }
-
-        // Přejmenuj
-        if (outputFile.exists()) outputFile.delete()
-        tempFile.renameTo(outputFile)
-
-        Log.d(TAG, "Download completed: ${outputFile.absolutePath}")
-        outputFile
+        // Použij novou metodu s checkpoint supportem
+        downloadModelWithCheckpoint(modelName, metadata, onProgress, null)
     }
 
     private suspend fun downloadChunkWithRetry(
@@ -278,100 +217,86 @@ class ParallelModelDownloader(private val context: Context) {
     internal suspend fun getModelMetadata(modelName: String): ModelMetadata? =
         withContext(Dispatchers.IO) {
             try {
-                val url = URL("$serverUrl/model-metadata/$modelName")
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "GET"
-                connection.connectTimeout = 5000
-                connection.readTimeout = 5000
+                val request = okhttp3.Request.Builder()
+                    .url("$serverUrl/model-metadata/$modelName")
+                    .get()
+                    .build()
 
-                if (connection.responseCode != HttpURLConnection.HTTP_OK) {
-                    connection.disconnect()
-                    return@withContext null
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.d(TAG, "Metadata request failed: ${response.code}")
+                        return@withContext null
+                    }
+
+                    val responseBody = response.body?.string() ?: return@withContext null
+                    val jsonResponse = JSONObject(responseBody)
+                    val metadata = jsonResponse.getJSONObject("metadata")
+
+                    val chunkHashesArray = metadata.getJSONArray("chunkHashes")
+                    val chunkHashes = mutableListOf<String>()
+                    for (i in 0 until chunkHashesArray.length()) {
+                        chunkHashes.add(chunkHashesArray.getString(i))
+                    }
+
+                    // Log protokol pro debugging
+                    Log.d(TAG, "Metadata retrieved via ${response.protocol}")
+
+                    ModelMetadata(
+                        modelName = metadata.getString("modelName"),
+                        totalChunks = metadata.getInt("totalChunks"),
+                        chunkSize = metadata.getInt("chunkSize"),
+                        totalSize = metadata.getLong("totalSize"),
+                        fileHash = metadata.getString("fileHash"),
+                        chunkHashes = chunkHashes
+                    )
                 }
-
-                val response = connection.inputStream.bufferedReader().readText()
-                connection.disconnect()
-
-                val jsonResponse = JSONObject(response)
-                val metadata = jsonResponse.getJSONObject("metadata")
-
-                val chunkHashesArray = metadata.getJSONArray("chunkHashes")
-                val chunkHashes = mutableListOf<String>()
-                for (i in 0 until chunkHashesArray.length()) {
-                    chunkHashes.add(chunkHashesArray.getString(i))
-                }
-
-                ModelMetadata(
-                    modelName = metadata.getString("modelName"),
-                    totalChunks = metadata.getInt("totalChunks"),
-                    chunkSize = metadata.getInt("chunkSize"),
-                    totalSize = metadata.getLong("totalSize"),
-                    fileHash = metadata.getString("fileHash"),
-                    chunkHashes = chunkHashes
-                )
             } catch (e: Exception) {
-                Log.d(TAG, "Metadata not available for $modelName")
+                Log.d(TAG, "Metadata not available for $modelName: ${e.message}")
                 null
             }
         }
 
     internal suspend fun downloadChunk(modelName: String, chunkIndex: Int): ByteArray? =
         withContext(Dispatchers.IO) {
-            var connection: HttpURLConnection? = null
             try {
-                val url = URL("$serverUrl/download-chunk/$modelName/$chunkIndex")
-                connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "GET"
-                connection.connectTimeout = 30000
-                connection.readTimeout = 60000
+                val request = okhttp3.Request.Builder()
+                    .url("$serverUrl/download-chunk/$modelName/$chunkIndex")
+                    .header("Accept-Encoding", "gzip")
+                    .get()
+                    .build()
 
-                // Request GZIP compression
-                connection.setRequestProperty("Accept-Encoding", "gzip")
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.e(TAG, "Chunk $chunkIndex HTTP error: ${response.code}")
+                        return@withContext null
+                    }
 
-                // 🆕 Přidej více headerů pro stability
-                connection.setRequestProperty("Connection", "close")  // Avoid keep-alive issues
-                connection.useCaches = false
-
-                val responseCode = connection.responseCode
-
-                if (responseCode == HttpURLConnection.HTTP_OK) {
-                    // Check for GZIP
-                    val contentEncoding = connection.getHeaderField("Content-Encoding")
+                    // OkHttp automaticky dekomprimuje GZIP, pokud server posílá s Content-Encoding: gzip
+                    // Ale server posílá raw .gz soubor, takže musíme dekomprimovat manuálně
+                    val contentEncoding = response.header("Content-Encoding")
                     val isGzipped = contentEncoding?.contains("gzip") == true
 
-                    // 🆕 Manuální GZIP dekomprese!
                     val data = if (isGzipped) {
-                        // Server poslal GZIP komprimovaná data → musíme je dekomprimovat
-                        val compressedData = connection.inputStream.use { stream ->
-                            stream.readBytes()
-                        }
+                        // Server použil Content-Encoding: gzip - OkHttp automaticky dekomprimuje
+                        val responseBytes = response.body?.bytes() ?: return@withContext null
 
-                        // Dekomprimuj pomocí GZIPInputStream
-                        val decompressed = java.util.zip.GZIPInputStream(
-                            java.io.ByteArrayInputStream(compressedData)
-                        ).use { gzipStream ->
-                            gzipStream.readBytes()
-                        }
+                        val originalSize = response.header("X-Original-Size")?.toLongOrNull()
+                        val compressedSize = response.header("X-Compressed-Size")?.toLongOrNull()
 
-                        val originalSize = connection.getHeaderField("X-Original-Size")?.toLongOrNull()
-                        val compressedSize = compressedData.size.toLong()
-                        if (originalSize != null && originalSize > 0) {
+                        if (originalSize != null && compressedSize != null && originalSize > 0) {
                             val savings = ((1 - compressedSize.toFloat() / originalSize) * 100).toInt()
-                            Log.d(TAG, "Chunk $chunkIndex: saved ${savings}% bandwidth (${compressedSize / 1024}KB → ${decompressed.size / 1024}KB)")
+                            Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: saved ${savings}% bandwidth (${compressedSize / 1024}KB → ${responseBytes.size / 1024}KB)")
                         }
 
-                        decompressed
+                        responseBytes
                     } else {
                         // Server poslal nekomprimovaná data
-                        connection.inputStream.use { stream ->
-                            stream.readBytes()
-                        }
+                        val responseBytes = response.body?.bytes() ?: return@withContext null
+                        Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: ${responseBytes.size / 1024}KB")
+                        responseBytes
                     }
 
                     data
-                } else {
-                    Log.e(TAG, "Chunk $chunkIndex HTTP error: $responseCode")
-                    null
                 }
             } catch (e: java.net.SocketTimeoutException) {
                 Log.e(TAG, "Chunk $chunkIndex timeout: ${e.message}")
@@ -382,8 +307,6 @@ class ParallelModelDownloader(private val context: Context) {
             } catch (e: Exception) {
                 Log.e(TAG, "Chunk $chunkIndex error: ${e.message}")
                 null
-            } finally {
-                connection?.disconnect()
             }
         }
 
@@ -456,5 +379,263 @@ class ParallelModelDownloader(private val context: Context) {
     fun getCacheSize(): Long {
         return fallbackDownloader.getCacheSize() +
                 cacheDir.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
+    }
+
+    // ========================================================================
+    // PAUSE/RESUME SUPPORT
+    // ========================================================================
+
+    /**
+     * Pozastaví aktivní download
+     */
+    suspend fun pauseDownload(modelName: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val job = activeJobs[modelName]
+            if (job == null) {
+                Log.w(TAG, "No active download for $modelName")
+                return@withContext false
+            }
+
+            // Cancel job
+            job.cancel()
+            activeJobs.remove(modelName)
+
+            Log.d(TAG, "Download paused: $modelName")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to pause download", e)
+            false
+        }
+    }
+
+    /**
+     * Pokračuje v pozastaveném downloadu
+     */
+    suspend fun resumeDownload(
+        modelName: String,
+        onProgress: ((DownloadProgress) -> Unit)?
+    ): File? = withContext(Dispatchers.IO) {
+        try {
+            // Načti uložený stav
+            val state = downloadStateManager.getDownloadState(modelName)
+            if (state == null) {
+                Log.w(TAG, "No saved state for $modelName")
+                return@withContext null
+            }
+
+            // Verifikuj tmp soubor
+            if (!downloadStateManager.verifyTmpFile(state)) {
+                Log.w(TAG, "Tmp file verification failed, starting from scratch")
+                downloadStateManager.deleteDownloadState(modelName)
+                return@withContext downloadModel(modelName, onProgress)
+            }
+
+            Log.d(TAG, "Resuming download: $modelName (${state.completedChunks.size}/${state.totalChunks} chunks)")
+
+            // Pokračuj s downloadem chunků
+            downloadModelWithCheckpoint(modelName, state.metadata, onProgress, state)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to resume download", e)
+            null
+        }
+    }
+
+    /**
+     * Kontroluje, zda může download pokračovat
+     */
+    fun canResumeDownload(modelName: String): Boolean {
+        val state = downloadStateManager.getDownloadState(modelName) ?: return false
+        return downloadStateManager.verifyTmpFile(state)
+    }
+
+    /**
+     * Zruší download a smaže všechny dočasné soubory
+     */
+    suspend fun cancelDownload(modelName: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            // Cancel aktivní job
+            activeJobs[modelName]?.cancel()
+            activeJobs.remove(modelName)
+
+            // Smaž tmp soubor
+            val state = downloadStateManager.getDownloadState(modelName)
+            state?.tmpFilePath?.let { path ->
+                File(path).delete()
+            }
+
+            // Smaž cached chunky
+            cacheDir.listFiles()?.filter { it.name.startsWith("${modelName}_chunk_") }?.forEach {
+                it.delete()
+            }
+
+            // Smaž checkpoint
+            downloadStateManager.deleteDownloadState(modelName)
+
+            Log.d(TAG, "Download cancelled: $modelName")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to cancel download", e)
+            false
+        }
+    }
+
+    /**
+     * Download s checkpoint supportem
+     */
+    private suspend fun downloadModelWithCheckpoint(
+        modelName: String,
+        metadata: ModelMetadata,
+        onProgress: ((DownloadProgress) -> Unit)?,
+        existingState: DownloadStateManager.DownloadStateData? = null
+    ): File? = withContext(Dispatchers.IO) {
+        val outputFile = File(modelsDir, modelName)
+        val tempFile = existingState?.tmpFilePath?.let { File(it) }
+            ?: File(modelsDir, "$modelName.tmp")
+
+        // Vytvoř prázdný soubor pokud neexistuje
+        if (!tempFile.exists()) {
+            RandomAccessFile(tempFile, "rw").use { it.setLength(metadata.totalSize) }
+        }
+
+        // Progress tracking
+        val completedChunks = existingState?.completedChunks?.toMutableSet() ?: mutableSetOf()
+        val downloadedChunks = AtomicInteger(completedChunks.size)
+        val downloadedBytes = AtomicLong(existingState?.downloadedBytes ?: 0)
+        val failedChunks = ConcurrentHashMap<Int, Int>()
+        var lastProgressTime = System.currentTimeMillis()
+        var lastDownloadedBytes = downloadedBytes.get()
+
+        // Určit které chunky je potřeba stáhnout
+        val chunksToDownload = (0 until metadata.totalChunks).filter { it !in completedChunks }
+
+        Log.d(TAG, "Downloading ${chunksToDownload.size} remaining chunks (${completedChunks.size} already done)")
+
+        // Semafora pro omezení paralelních stahování
+        val semaphore = Semaphore(maxParallelDownloads)
+
+        // Vytvoř job pro tento download
+        val downloadJob = coroutineContext[Job]!!
+        activeJobs[modelName] = downloadJob
+
+        // Stáhni chybějící chunky paralelně
+        val jobs = chunksToDownload.map { chunkIndex ->
+            async {
+                semaphore.withPermit {
+                    val startTime = System.currentTimeMillis()
+
+                    downloadChunkWithRetry(
+                        modelName,
+                        chunkIndex,
+                        metadata,
+                        tempFile
+                    )?.also { chunkSize ->
+                        // Označ chunk jako hotový
+                        completedChunks.add(chunkIndex)
+                        downloadedChunks.incrementAndGet()
+                        downloadedBytes.addAndGet(chunkSize.toLong())
+
+                        // Uložit checkpoint
+                        downloadStateManager.updateCompletedChunks(modelName, chunkIndex)
+
+                        // Vypočti rychlost
+                        val elapsed = System.currentTimeMillis() - startTime
+                        if (elapsed > 0) {
+                            val speed = (chunkSize * 1000L) / elapsed
+                            bandwidthMonitor.updateSpeed(speed)
+                        }
+
+                        // Update progress
+                        val currentTime = System.currentTimeMillis()
+                        val timeDiff = currentTime - lastProgressTime
+
+                        if (timeDiff > 300) {
+                            val currentBytes = downloadedBytes.get()
+                            val bytesDiff = currentBytes - lastDownloadedBytes
+                            val speed = if (timeDiff > 0) (bytesDiff * 1000) / timeDiff else 0
+                            val remainingBytes = metadata.totalSize - currentBytes
+                            val eta = if (speed > 0) remainingBytes / speed else 0
+
+                            onProgress?.invoke(
+                                DownloadProgress(
+                                    downloadedChunks = downloadedChunks.get(),
+                                    totalChunks = metadata.totalChunks,
+                                    downloadedBytes = currentBytes,
+                                    totalBytes = metadata.totalSize,
+                                    currentSpeed = speed,
+                                    eta = eta
+                                )
+                            )
+
+                            lastProgressTime = currentTime
+                            lastDownloadedBytes = currentBytes
+                        }
+                    } ?: run {
+                        failedChunks[chunkIndex] = (failedChunks[chunkIndex] ?: 0) + 1
+                        null
+                    }
+                }
+            }
+        }
+
+        // Počkej na všechny
+        try {
+            jobs.awaitAll()
+        } catch (e: CancellationException) {
+            // Download byl pozastaven
+            Log.d(TAG, "Download paused by user")
+            downloadStateManager.saveDownloadState(
+                modelName = modelName,
+                completedChunks = completedChunks,
+                totalChunks = metadata.totalChunks,
+                downloadedBytes = downloadedBytes.get(),
+                totalBytes = metadata.totalSize,
+                isPaused = true,
+                metadata = metadata,
+                tmpFilePath = tempFile.absolutePath
+            )
+            activeJobs.remove(modelName)
+            return@withContext null
+        }
+
+        // Odstraň z active jobs
+        activeJobs.remove(modelName)
+
+        // Zkontroluj chyby
+        if (failedChunks.isNotEmpty()) {
+            Log.e(TAG, "Failed chunks: ${failedChunks.keys}")
+            downloadStateManager.saveDownloadState(
+                modelName = modelName,
+                completedChunks = completedChunks,
+                totalChunks = metadata.totalChunks,
+                downloadedBytes = downloadedBytes.get(),
+                totalBytes = metadata.totalSize,
+                isPaused = true,
+                metadata = metadata,
+                tmpFilePath = tempFile.absolutePath
+            )
+            return@withContext null
+        }
+
+        // Ověř hash
+        Log.d(TAG, "Verifying integrity...")
+        val fileHash = calculateFileHash(tempFile)
+
+        if (fileHash != metadata.fileHash) {
+            Log.e(TAG, "Hash mismatch!")
+            tempFile.delete()
+            downloadStateManager.deleteDownloadState(modelName)
+            return@withContext null
+        }
+
+        // Přejmenuj
+        if (outputFile.exists()) outputFile.delete()
+        tempFile.renameTo(outputFile)
+
+        // Smaž checkpoint
+        downloadStateManager.deleteDownloadState(modelName)
+
+        Log.d(TAG, "Download completed: ${outputFile.absolutePath}")
+        outputFile
     }
 }
