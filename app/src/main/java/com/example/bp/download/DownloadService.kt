@@ -14,10 +14,7 @@ import com.example.bp.MainActivity
 import com.example.bp.R
 import kotlinx.coroutines.*
 
-/**
- * Foreground Service pro stahování modelů na pozadí
- * Zobrazuje persistent notifikaci s průběhem
- */
+
 class DownloadService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -122,14 +119,12 @@ class DownloadService : Service() {
     private fun startDownloadInternal(modelName: String) {
         currentModelName = modelName
 
-        // Start foreground s počáteční notifikací
         startForeground(NOTIFICATION_ID, createNotification(
             modelName = modelName,
             progress = 0,
             isPaused = false
         ))
 
-        // Spusť download v coroutine
         currentDownloadJob = serviceScope.launch {
             try {
                 val downloadManager = DownloadManager(applicationContext)
@@ -145,7 +140,6 @@ class DownloadService : Service() {
                     )
                 }
 
-                // Download dokončen
                 showCompletedNotification(modelName)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -179,7 +173,6 @@ class DownloadService : Service() {
     private fun resumeDownloadInternal(modelName: String) {
         currentModelName = modelName
 
-        // Start foreground s resuming notifikací
         startForeground(NOTIFICATION_ID, createNotification(
             modelName = modelName,
             progress = 0,
@@ -201,7 +194,6 @@ class DownloadService : Service() {
                     )
                 }
 
-                // Download dokončen
                 showCompletedNotification(modelName)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -278,7 +270,6 @@ class DownloadService : Service() {
             builder.setProgress(100, progress, progress == 0)
         }
 
-        // Přidej akční tlačítka
         if (!isPaused) {
             val pauseIntent = Intent(this, DownloadService::class.java).apply {
                 action = ACTION_PAUSE_DOWNLOAD

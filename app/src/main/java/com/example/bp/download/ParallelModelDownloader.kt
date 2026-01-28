@@ -16,18 +16,13 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * Vylepšený downloader s paralelním stahováním chunků
- * Fallback na původní ModelDownloader pro kompatibilitu
- */
+
 class ParallelModelDownloader(private val context: Context) {
 
-    // HTTP/2 server URL (HTTPS na portu 3443)
     private val serverUrl = "https://192.168.50.96:3443"
     private val cacheDir = File(context.cacheDir, "model_chunks")
     private val modelsDir = File(context.filesDir, "models")
 
-    // HTTP/2 klient
     private val httpClient = Http2ClientManager.chunkClient
 
     // Fallback na původní downloader
@@ -36,14 +31,14 @@ class ParallelModelDownloader(private val context: Context) {
     // Bandwidth monitor
     private val bandwidthMonitor = BandwidthMonitor(context)
 
-    // Download state manager pro persistence
+    // Download state manager
     private val downloadStateManager = DownloadStateManager(context)
 
     // Active jobs tracking pro pause/resume
     private val activeJobs = ConcurrentHashMap<String, Job>()
 
     // Konfigurace
-    private var maxParallelDownloads = 3  // Default, bude se měnit podle rychlosti
+    private var maxParallelDownloads = 3
     private val maxRetries = 3
     private val retryDelayMs = 1000L
 
@@ -56,17 +51,16 @@ class ParallelModelDownloader(private val context: Context) {
         if (!modelsDir.exists()) modelsDir.mkdirs()
     }
 
-    // ========================================================================
+
     // PUBLIC API - kompatibilní s původním ModelDownloaderem
-    // ========================================================================
+
 
     suspend fun getAvailableModels(): List<ModelInfo> {
         return fallbackDownloader.getAvailableModels()
     }
 
-    /**
-     * HLAVNÍ METODA - automaticky vybere nejlepší způsob stahování
-     */
+
+    // HLAVNÍ METODA - automaticky vybere nejlepší způsob stahování
     suspend fun downloadModel(
         modelName: String,
         onProgress: ((DownloadProgress) -> Unit)? = null
@@ -104,9 +98,7 @@ class ParallelModelDownloader(private val context: Context) {
         }
     }
 
-    // ========================================================================
     // PARALELNÍ STAHOVÁNÍ
-    // ========================================================================
 
     private suspend fun downloadModelParallel(
         modelName: String,
@@ -137,7 +129,6 @@ class ParallelModelDownloader(private val context: Context) {
             tmpFilePath = tempFile.absolutePath
         )
 
-        // Použij novou metodu s checkpoint supportem
         downloadModelWithCheckpoint(modelName, metadata, onProgress, null)
     }
 
@@ -156,7 +147,6 @@ class ParallelModelDownloader(private val context: Context) {
                 Log.d(TAG, "Using cached chunk $chunkIndex")
                 cachedChunk
             } else {
-                // Stáhni chunk
                 downloadChunk(modelName, chunkIndex)
             }
 
@@ -167,11 +157,11 @@ class ParallelModelDownloader(private val context: Context) {
             // Ověř hash
             if (!verifyChunkHash(chunkData, metadata.chunkHashes[chunkIndex])) {
                 Log.e(TAG, "Chunk $chunkIndex hash mismatch!")
-                Log.e(TAG, "  Expected: ${metadata.chunkHashes[chunkIndex]}")
-                Log.e(TAG, "  Got: ${MessageDigest.getInstance("SHA-256").digest(chunkData).joinToString("") { "%02x".format(it) }}")
-                Log.e(TAG, "  Size: ${chunkData.size} bytes")
+                Log.e(TAG, "Expected: ${metadata.chunkHashes[chunkIndex]}")
+                Log.e(TAG, "Got: ${MessageDigest.getInstance("SHA-256").digest(chunkData).joinToString("") { "%02x".format(it) }}")
+                Log.e(TAG, "Size: ${chunkData.size} bytes")
 
-                // 🆕 Smaž vadnou cache
+                // Smaž vadnou cache
                 val cacheFile = File(cacheDir, "${modelName}_chunk_$chunkIndex")
                 if (cacheFile.exists()) {
                     cacheFile.delete()
@@ -210,9 +200,9 @@ class ParallelModelDownloader(private val context: Context) {
         }
     }
 
-    // ========================================================================
+
     // HELPER METODY - INTERNAL pro ProgressiveModelLoader
-    // ========================================================================
+
 
     internal suspend fun getModelMetadata(modelName: String): ModelMetadata? =
         withContext(Dispatchers.IO) {
@@ -261,7 +251,6 @@ class ParallelModelDownloader(private val context: Context) {
             try {
                 val request = okhttp3.Request.Builder()
                     .url("$serverUrl/download-chunk/$modelName/$chunkIndex")
-                    // Požádáme o komprimovanou verzi
                     .header("Accept-Encoding", "gzip")
                     .get()
                     .build()
@@ -278,8 +267,6 @@ class ParallelModelDownloader(private val context: Context) {
                     val compressedSize = response.header("X-Compressed-Size")?.toLongOrNull()
 
                     val data = if (isCompressed) {
-                        // Server poslal GZIP komprimovaný chunk (raw .gz soubor)
-                        // Musíme ho manuálně dekomprimovat
                         val compressedBytes = response.body?.bytes() ?: return@withContext null
 
                         val decompressed = try {
@@ -300,7 +287,6 @@ class ParallelModelDownloader(private val context: Context) {
 
                         decompressed
                     } else {
-                        // Server poslal nekomprimovaná data
                         val responseBytes = response.body?.bytes() ?: return@withContext null
                         Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: ${responseBytes.size / 1024}KB (uncompressed)")
                         responseBytes
@@ -361,9 +347,9 @@ class ParallelModelDownloader(private val context: Context) {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
-    // ========================================================================
+
     // KOMPATIBILNÍ API s původním ModelDownloaderem
-    // ========================================================================
+
 
     fun isModelDownloaded(modelName: String): Boolean {
         return fallbackDownloader.isModelDownloaded(modelName)
@@ -391,13 +377,9 @@ class ParallelModelDownloader(private val context: Context) {
                 cacheDir.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
     }
 
-    // ========================================================================
-    // PAUSE/RESUME SUPPORT
-    // ========================================================================
 
-    /**
-     * Pozastaví aktivní download
-     */
+    // PAUSE/RESUME SUPPORT
+
     suspend fun pauseDownload(modelName: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val job = activeJobs[modelName]
@@ -406,7 +388,6 @@ class ParallelModelDownloader(private val context: Context) {
                 return@withContext false
             }
 
-            // Cancel job
             job.cancel()
             activeJobs.remove(modelName)
 
@@ -418,9 +399,6 @@ class ParallelModelDownloader(private val context: Context) {
         }
     }
 
-    /**
-     * Pokračuje v pozastaveném downloadu
-     */
     suspend fun resumeDownload(
         modelName: String,
         onProgress: ((DownloadProgress) -> Unit)?
@@ -442,7 +420,6 @@ class ParallelModelDownloader(private val context: Context) {
 
             Log.d(TAG, "Resuming download: $modelName (${state.completedChunks.size}/${state.totalChunks} chunks)")
 
-            // Pokračuj s downloadem chunků
             downloadModelWithCheckpoint(modelName, state.metadata, onProgress, state)
 
         } catch (e: Exception) {
@@ -451,17 +428,13 @@ class ParallelModelDownloader(private val context: Context) {
         }
     }
 
-    /**
-     * Kontroluje, zda může download pokračovat
-     */
+
     fun canResumeDownload(modelName: String): Boolean {
         val state = downloadStateManager.getDownloadState(modelName) ?: return false
         return downloadStateManager.verifyTmpFile(state)
     }
 
-    /**
-     * Zruší download a smaže všechny dočasné soubory
-     */
+
     suspend fun cancelDownload(modelName: String): Boolean = withContext(Dispatchers.IO) {
         try {
             // Cancel aktivní job
@@ -490,9 +463,7 @@ class ParallelModelDownloader(private val context: Context) {
         }
     }
 
-    /**
-     * Download s checkpoint supportem
-     */
+
     private suspend fun downloadModelWithCheckpoint(
         modelName: String,
         metadata: ModelMetadata,
@@ -516,7 +487,6 @@ class ParallelModelDownloader(private val context: Context) {
         var lastProgressTime = System.currentTimeMillis()
         var lastDownloadedBytes = downloadedBytes.get()
 
-        // Určit které chunky je potřeba stáhnout
         val chunksToDownload = (0 until metadata.totalChunks).filter { it !in completedChunks }
 
         Log.d(TAG, "Downloading ${chunksToDownload.size} remaining chunks (${completedChunks.size} already done)")
@@ -524,11 +494,9 @@ class ParallelModelDownloader(private val context: Context) {
         // Semafora pro omezení paralelních stahování
         val semaphore = Semaphore(maxParallelDownloads)
 
-        // Vytvoř job pro tento download
         val downloadJob = coroutineContext[Job]!!
         activeJobs[modelName] = downloadJob
 
-        // Stáhni chybějící chunky paralelně
         val jobs = chunksToDownload.map { chunkIndex ->
             async {
                 semaphore.withPermit {
@@ -540,12 +508,10 @@ class ParallelModelDownloader(private val context: Context) {
                         metadata,
                         tempFile
                     )?.also { chunkSize ->
-                        // Označ chunk jako hotový
                         completedChunks.add(chunkIndex)
                         downloadedChunks.incrementAndGet()
                         downloadedBytes.addAndGet(chunkSize.toLong())
 
-                        // Uložit checkpoint
                         downloadStateManager.updateCompletedChunks(modelName, chunkIndex)
 
                         // Vypočti rychlost
@@ -588,11 +554,9 @@ class ParallelModelDownloader(private val context: Context) {
             }
         }
 
-        // Počkej na všechny
         try {
             jobs.awaitAll()
         } catch (e: CancellationException) {
-            // Download byl pozastaven
             Log.d(TAG, "Download paused by user")
             downloadStateManager.saveDownloadState(
                 modelName = modelName,
@@ -608,10 +572,8 @@ class ParallelModelDownloader(private val context: Context) {
             return@withContext null
         }
 
-        // Odstraň z active jobs
         activeJobs.remove(modelName)
 
-        // Zkontroluj chyby
         if (failedChunks.isNotEmpty()) {
             Log.e(TAG, "Failed chunks: ${failedChunks.keys}")
             downloadStateManager.saveDownloadState(
@@ -627,7 +589,6 @@ class ParallelModelDownloader(private val context: Context) {
             return@withContext null
         }
 
-        // Ověř hash
         Log.d(TAG, "Verifying integrity...")
         val fileHash = calculateFileHash(tempFile)
 
@@ -638,11 +599,9 @@ class ParallelModelDownloader(private val context: Context) {
             return@withContext null
         }
 
-        // Přejmenuj
         if (outputFile.exists()) outputFile.delete()
         tempFile.renameTo(outputFile)
 
-        // Smaž checkpoint
         downloadStateManager.deleteDownloadState(modelName)
 
         Log.d(TAG, "Download completed: ${outputFile.absolutePath}")

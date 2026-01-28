@@ -2,11 +2,15 @@ package com.example.bp
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -32,7 +36,6 @@ fun ModelScreen() {
     }
 
     var debugForceParallel by remember { mutableStateOf(false) }
-    var debugParallelCount by remember { mutableStateOf(5) }
 
     var availableModels by remember { mutableStateOf<List<ModelInfo>>(emptyList()) }
     var selectedModel by remember { mutableStateOf<ModelInfo?>(null) }
@@ -52,6 +55,9 @@ fun ModelScreen() {
     // Job tracking pro cancellation
     var downloadJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
+    // Menu collapse state
+    var isMenuExpanded by remember { mutableStateOf(true) }
+
     // Cleanup při dispose
     DisposableEffect(Unit) {
         onDispose {
@@ -63,7 +69,6 @@ fun ModelScreen() {
         isLoading = true
         errorMessage = null
         try {
-            // Inicializuj download manager
             downloadManager.initialize()
 
             availableModels = downloadManager.getAvailableModels()
@@ -173,26 +178,52 @@ fun ModelScreen() {
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("3D Model Viewer", style = MaterialTheme.typography.headlineSmall)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("3D Model Viewer", style = MaterialTheme.typography.headlineSmall)
+                        if (!isMenuExpanded && selectedModel != null) {
+                            Text(
+                                selectedModel!!.name,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
 
-                    IconButton(
-                        onClick = {
-                            scope.launch {
-                                isLoading = true
-                                availableModels = downloadManager.getAvailableModels()
-                                cacheSize = downloadManager.getCacheSize()
-                                isLoading = false
+                    Row {
+                        if (isMenuExpanded) {
+                            IconButton(
+                                onClick = {
+                                    scope.launch {
+                                        isLoading = true
+                                        availableModels = downloadManager.getAvailableModels()
+                                        cacheSize = downloadManager.getCacheSize()
+                                        isLoading = false
+                                    }
+                                },
+                                enabled = !isLoading
+                            ) {
+                                Icon(Icons.Default.Refresh, "Obnovit")
                             }
-                        },
-                        enabled = !isLoading
-                    ) {
-                        Icon(Icons.Default.Refresh, "Obnovit")
+                        }
+
+                        IconButton(onClick = { isMenuExpanded = !isMenuExpanded }) {
+                            Icon(
+                                if (isMenuExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                if (isMenuExpanded) "Zabalit menu" else "Rozbalit menu"
+                            )
+                        }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(8.dp))
+                AnimatedVisibility(
+                    visible = isMenuExpanded,
+                    enter = expandVertically() + fadeIn(),
+                    exit = shrinkVertically() + fadeOut()
+                ) {
+                    Column {
+                        Spacer(modifier = Modifier.height(8.dp))
 
-                // DEBUG SECTION
+                        // DEBUG SECTION
                 var showDebug by remember { mutableStateOf(false) }
 
                 Row(
@@ -231,20 +262,6 @@ fun ModelScreen() {
                                         debugForceParallel = it
                                         downloadManager.debugForceParallel = it
                                     }
-                                )
-                            }
-
-                            if (debugForceParallel) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("Parallel Chunks: $debugParallelCount")
-                                Slider(
-                                    value = debugParallelCount.toFloat(),
-                                    onValueChange = {
-                                        debugParallelCount = it.toInt()
-                                        downloadManager.debugParallelCount = it.toInt()
-                                    },
-                                    valueRange = 1f..10f,
-                                    steps = 8
                                 )
                             }
 
@@ -332,7 +349,6 @@ fun ModelScreen() {
                                                 }
                                             }
                                         }
-                                        // Vždy zobrazuj delete button pokud je model stažený, díky uiRefreshTrigger se aktualizuje
                                         key(uiRefreshTrigger) {
                                             if (downloadManager.isModelDownloaded(model.name)) {
                                                 IconButton(
@@ -627,12 +643,14 @@ fun ModelScreen() {
                     }
                 }
 
-                errorMessage?.let { error ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
-                    ) {
-                        Text("❌ $error", modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
+                        errorMessage?.let { error ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                            ) {
+                                Text("❌ $error", modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
                     }
                 }
             }
@@ -645,7 +663,6 @@ fun ModelScreen() {
                         // Hot-swap: ModelViewer zůstane, jen se vymění model
                         ModelViewer(
                             modifier = Modifier.fillMaxSize(),
-                            modelSource = ModelSource.FILE,
                             modelPath = downloadedModelPath!!,
                             onModelLoaded = {
                                 Log.d("ModelScreen", "✅ Model fully loaded in viewer")

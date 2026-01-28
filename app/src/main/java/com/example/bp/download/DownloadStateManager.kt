@@ -7,10 +7,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
 
-/**
- * Správce persistence stavu downloadů
- * Ukládá stav do SharedPreferences pro přežití restartu aplikace/telefonu
- */
+
 class DownloadStateManager(context: Context) {
 
     private val prefs: SharedPreferences = context.getSharedPreferences(
@@ -25,9 +22,9 @@ class DownloadStateManager(context: Context) {
         private const val PREFIX_DOWNLOAD_STATE = "download_"
     }
 
-    /**
-     * Data struktura pro uložený stav downloadu
-     */
+
+     // Data struktura pro uložený stav downloadu
+
     data class DownloadStateData(
         val modelName: String,
         val totalChunks: Int,
@@ -40,9 +37,7 @@ class DownloadStateManager(context: Context) {
         val tmpFilePath: String? = null
     )
 
-    /**
-     * Uloží stav downloadu
-     */
+
     @Synchronized
     fun saveDownloadState(
         modelName: String,
@@ -72,7 +67,6 @@ class DownloadStateManager(context: Context) {
                 .putString(getStateKey(modelName), json)
                 .apply()
 
-            // Aktualizuj seznam aktivních downloadů
             updateActiveDownloadsList(modelName, add = true)
 
             Log.d(TAG, "Saved state for $modelName: ${completedChunks.size}/$totalChunks chunks")
@@ -81,9 +75,7 @@ class DownloadStateManager(context: Context) {
         }
     }
 
-    /**
-     * Načte stav downloadu
-     */
+
     @Synchronized
     fun getDownloadState(modelName: String): DownloadStateData? {
         return try {
@@ -95,9 +87,7 @@ class DownloadStateManager(context: Context) {
         }
     }
 
-    /**
-     * Smaže stav downloadu
-     */
+
     @Synchronized
     fun deleteDownloadState(modelName: String) {
         try {
@@ -113,9 +103,7 @@ class DownloadStateManager(context: Context) {
         }
     }
 
-    /**
-     * Získá všechny pending/paused downloady
-     */
+
     @Synchronized
     fun getAllPendingDownloads(): List<DownloadStateData> {
         return try {
@@ -129,9 +117,6 @@ class DownloadStateManager(context: Context) {
         }
     }
 
-    /**
-     * Aktualizuje seznam dokončených chunků
-     */
     @Synchronized
     fun updateCompletedChunks(modelName: String, chunkIndex: Int) {
         try {
@@ -153,9 +138,7 @@ class DownloadStateManager(context: Context) {
         }
     }
 
-    /**
-     * Verifikuje, že tmp soubor existuje a má správnou velikost
-     */
+
     fun verifyTmpFile(state: DownloadStateData): Boolean {
         val tmpFile = state.tmpFilePath?.let { File(it) } ?: return false
         if (!tmpFile.exists()) {
@@ -169,9 +152,7 @@ class DownloadStateManager(context: Context) {
         return true
     }
 
-    /**
-     * Vyčistí všechny staré downloady (starší než 7 dní)
-     */
+
     @Synchronized
     fun cleanupOldDownloads() {
         try {
@@ -194,9 +175,9 @@ class DownloadStateManager(context: Context) {
         }
     }
 
-    // ========================================================================
+
     // PRIVATE METODY
-    // ========================================================================
+
 
     private fun getStateKey(modelName: String): String {
         return "$PREFIX_DOWNLOAD_STATE$modelName"

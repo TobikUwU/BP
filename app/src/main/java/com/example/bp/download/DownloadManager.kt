@@ -5,19 +5,14 @@ import android.util.Log
 import kotlinx.coroutines.flow.*
 import java.io.File
 
-/**
- * Centrální správce stahování - orchestruje všechny download operace
- * Rozhoduje o nejlepší strategii stahování na základě podmínek
- */
+
 class DownloadManager(private val context: Context) {
 
     private val parallelDownloader = ParallelModelDownloader(context)
     private val bandwidthMonitor = BandwidthMonitor(context)
     private val downloadStateManager = DownloadStateManager(context)
 
-    // 🆕 DEBUG FLAGS
     var debugForceParallel = false
-    var debugParallelCount = 5
 
     // Download queue
     private val _downloadQueue = MutableStateFlow<List<QueuedDownload>>(emptyList())
@@ -53,31 +48,17 @@ class DownloadManager(private val context: Context) {
     }
 
     data class DownloadStrategy(
-        val useParallel: Boolean,
-        val maxParallelChunks: Int,
-        val compressionEnabled: Boolean,
-        val qualityMode: QualityMode
+        val useParallel: Boolean
     )
-
-    enum class QualityMode {
-        AUTO,      // Automaticky podle sítě
-        LOW,       // Jen základní chunky
-        MEDIUM,    // 50% chunků
-        HIGH,      // 80% chunků
-        ULTRA      // Všechny chunky
-    }
 
     companion object {
         private const val TAG = "DownloadManager"
     }
 
-    // ========================================================================
-    // HLAVNÍ API
-    // ========================================================================
 
-    /**
-     * Inteligentní download - automaticky vybere nejlepší strategii
-     */
+    // HLAVNÍ API
+
+
     suspend fun downloadModelSmart(
         modelInfo: ModelInfo,
         onProgress: ((DownloadProgress) -> Unit)? = null
@@ -87,8 +68,6 @@ class DownloadManager(private val context: Context) {
         Log.d(TAG, """
             Download strategy for ${modelInfo.name}:
             - Parallel: ${strategy.useParallel}
-            - Max chunks: ${strategy.maxParallelChunks}
-            - Quality: ${strategy.qualityMode}
             - Network: ${bandwidthMonitor.networkStats.value.connectionType}
         """.trimIndent())
 
@@ -129,9 +108,7 @@ class DownloadManager(private val context: Context) {
         }
     }
 
-    /**
-     * Přidej do fronty stahování
-     */
+
     fun queueDownload(modelInfo: ModelInfo, priority: Priority = Priority.NORMAL) {
         val queued = QueuedDownload(modelInfo.name, modelInfo, priority)
         _downloadQueue.value = (_downloadQueue.value + queued)
@@ -140,30 +117,26 @@ class DownloadManager(private val context: Context) {
         Log.d(TAG, "Added to queue: ${modelInfo.name} (priority: $priority)")
     }
 
-    /**
-     * Odeber z fronty
-     */
+
     fun removeFromQueue(modelName: String) {
         _downloadQueue.value = _downloadQueue.value.filter { it.modelName != modelName }
     }
 
-    /**
-     * Vyčisti frontu
-     */
+
     fun clearQueue() {
         _downloadQueue.value = emptyList()
     }
 
-    // ========================================================================
-    // STRATEGIE STAHOVÁNÍ
-    // ========================================================================
 
-    /**
-     * Určí optimální strategii stahování na základě:
-     * - Typu připojení
-     * - Rychlosti sítě
-     * - Velikosti souboru
-     * - Metered connection
+    // STRATEGIE STAHOVÁNÍ
+
+
+    /*
+      Určí optimální strategii stahování na základě:
+      - Typu připojení
+      - Rychlosti sítě
+      - Velikosti souboru
+      - Metered connection
      */
     private fun determineOptimalStrategy(modelInfo: ModelInfo): DownloadStrategy {
         val networkStats = bandwidthMonitor.networkStats.value
@@ -171,6 +144,7 @@ class DownloadManager(private val context: Context) {
 
         // Debug mode má přednost
         val useParallel = if (debugForceParallel) {
+            Log.d(TAG, "🔧 DEBUG MODE: Force parallel enabled!")
             true
         } else {
             // Automatická detekce
@@ -184,55 +158,18 @@ class DownloadManager(private val context: Context) {
             }
         }
 
-        // Počet paralelních chunků
-        val maxParallel = if (useParallel) {
-            if (debugForceParallel) {
-                // Debug mode - použij nastavený počet
-                debugParallelCount
-            } else if (networkStats.recommendedParallelism > 1) {
-                // Automatická detekce podle rychlosti
-                networkStats.recommendedParallelism
-            } else {
-                // Default fallback pokud není známa rychlost
-                3
-            }
-        } else {
-            1
-        }
+        Log.d(TAG, "Strategy: parallel=$useParallel (debugForceParallel=$debugForceParallel)")
 
-        // Kvalita podle typu připojení
-        val qualityMode = when {
-            networkStats.isMetered && networkStats.connectionType != BandwidthMonitor.ConnectionType.WIFI -> {
-                when (networkStats.connectionType) {
-                    BandwidthMonitor.ConnectionType.CELLULAR_5G -> QualityMode.HIGH
-                    BandwidthMonitor.ConnectionType.CELLULAR_4G -> QualityMode.MEDIUM
-                    else -> QualityMode.LOW
-                }
-            }
-            else -> QualityMode.ULTRA
-        }
-
-        Log.d(TAG, "Strategy: parallel=$useParallel, maxParallel=$maxParallel, quality=$qualityMode")
-
-        return DownloadStrategy(
-            useParallel = useParallel,
-            maxParallelChunks = maxParallel,
-            compressionEnabled = networkStats.isMetered,
-            qualityMode = qualityMode
-        )
+        return DownloadStrategy(useParallel = useParallel)
     }
 
-    /**
-     * Měl by uživatel být varován?
-     */
+
     fun shouldShowMeteredWarning(modelInfo: ModelInfo): Boolean {
         val modelSizeBytes = (modelInfo.sizeInMB * 1024 * 1024).toLong()
         return bandwidthMonitor.shouldWarnAboutMeteredConnection(modelSizeBytes)
     }
 
-    /**
-     * Získej doporučení pro uživatele
-     */
+
     fun getDownloadRecommendation(modelInfo: ModelInfo): String {
         val strategy = determineOptimalStrategy(modelInfo)
         val networkStats = bandwidthMonitor.networkStats.value
@@ -245,10 +182,8 @@ class DownloadManager(private val context: Context) {
             }
 
             append("📦 Strategie: ")
-            append(if (strategy.useParallel) "Paralelní (${strategy.maxParallelChunks}×)" else "Sekvenční")
+            append(if (strategy.useParallel) "Paralelní" else "Sekvenční")
             append("\n")
-
-            append("🎨 Kvalita: ${strategy.qualityMode.name}\n")
 
             val estimatedTime = estimateDownloadTime(modelInfo, networkStats)
             if (estimatedTime > 0) {
@@ -275,9 +210,9 @@ class DownloadManager(private val context: Context) {
         }
     }
 
-    // ========================================================================
+
     // DELEGOVANÉ METODY
-    // ========================================================================
+
 
     suspend fun getAvailableModels(): List<ModelInfo> {
         return parallelDownloader.getAvailableModels()
@@ -311,13 +246,9 @@ class DownloadManager(private val context: Context) {
         return bandwidthMonitor.networkStats.value
     }
 
-    // ========================================================================
     // PAUSE/RESUME/CANCEL
-    // ========================================================================
 
-    /**
-     * Pozastaví aktivní download
-     */
+
     suspend fun pauseDownload(modelName: String): Boolean {
         return try {
             val success = parallelDownloader.pauseDownload(modelName)
@@ -332,9 +263,7 @@ class DownloadManager(private val context: Context) {
         }
     }
 
-    /**
-     * Pokračuje v pozastaveném downloadu
-     */
+
     suspend fun resumeDownload(
         modelName: String,
         onProgress: ((DownloadProgress) -> Unit)? = null
@@ -362,9 +291,7 @@ class DownloadManager(private val context: Context) {
         }
     }
 
-    /**
-     * Zruší download a smaže vše
-     */
+
     suspend fun cancelDownload(modelName: String): Boolean {
         return try {
             val success = parallelDownloader.cancelDownload(modelName)
@@ -379,16 +306,11 @@ class DownloadManager(private val context: Context) {
         }
     }
 
-    /**
-     * Získá seznam pausnutých downloadů
-     */
+
     fun getPausedDownloads(): List<DownloadStateManager.DownloadStateData> {
         return downloadStateManager.getAllPendingDownloads().filter { it.isPaused }
     }
 
-    /**
-     * Automaticky obnoví všechny pausnuté downloady při startu
-     */
     suspend fun autoResumeDownloads(): Int {
         return try {
             val pausedDownloads = getPausedDownloads()
@@ -411,23 +333,16 @@ class DownloadManager(private val context: Context) {
         }
     }
 
-    /**
-     * Kontroluje, zda lze download obnovit
-     */
     fun canResumeDownload(modelName: String): Boolean {
         return parallelDownloader.canResumeDownload(modelName)
     }
 
-    /**
-     * Refresh seznam pausnutých downloadů
-     */
+
     private fun refreshPausedDownloads() {
         _pausedDownloads.value = getPausedDownloads()
     }
 
-    /**
-     * Inicializace při startu - načte pausnuté downloady
-     */
+
     fun initialize() {
         refreshPausedDownloads()
         downloadStateManager.cleanupOldDownloads()

@@ -7,9 +7,9 @@ import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
-/**
- * Monitoruje síťovou rychlost a typ připojení
- */
+
+  // Monitoruje síťovou rychlost a typ připojení
+
 class BandwidthMonitor(private val context: Context) {
 
     data class NetworkStats(

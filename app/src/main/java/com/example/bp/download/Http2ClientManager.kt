@@ -11,36 +11,35 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
-/**
- * Správce HTTP/2 klienta s podporou self-signed certifikátů
- * OkHttp automaticky používá HTTP/2 pokud je server podporuje
- */
+
+// Správce HTTP/2 klienta s podporou self-signed certifikátů
+// OkHttp automaticky používá HTTP/2 pokud je server podporuje
+
 object Http2ClientManager {
 
     private const val TAG = "Http2ClientManager"
 
-    /**
-     * Trust manager pro self-signed certifikáty (pouze pro development!)
-     */
+
+    // Trust manager pro self-signed certifikáty (pouze pro development!)
+
     private val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
         override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
         override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
     })
 
-    /**
-     * SSL Context pro důvěru všem certifikátům
-     */
+
+     // SSL Context pro důvěru všem certifikátům
+
     private val trustAllSslContext = SSLContext.getInstance("TLS").apply {
         init(null, trustAllCerts, SecureRandom())
     }
 
-    /**
-     * OkHttp klient s HTTP/2 supportem
-     */
+
+     // OkHttp klient s HTTP/2 supportem
+
     val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            // HTTP/2 support - OkHttp automaticky použije HTTP/2 pokud server podporuje
             .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
 
             // Connection pooling pro multiplexing
@@ -57,11 +56,10 @@ object Http2ClientManager {
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
 
-            // Self-signed certificate support (pouze pro development!)
+            // Self-signed certificate support
             .sslSocketFactory(trustAllSslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
             .hostnameVerifier { _, _ -> true }
 
-            // Connection specs - preferuj moderní TLS
             .connectionSpecs(
                 listOf(
                     ConnectionSpec.MODERN_TLS,
@@ -70,18 +68,17 @@ object Http2ClientManager {
                 )
             )
 
-            // Retry on connection failure
             .retryOnConnectionFailure(true)
 
-            // Event listener pro debugging (volitelné)
+            // Event listener pro debugging
             .eventListener(Http2EventListener())
 
             .build()
     }
 
-    /**
-     * Klient specificky pro chunky s agressivnějším connection poolingem
-     */
+
+    // Klient specificky pro chunky s agressivnějším connection poolingem
+
     val chunkClient: OkHttpClient by lazy {
         client.newBuilder()
             // Více paralelních připojení pro chunky
@@ -92,14 +89,13 @@ object Http2ClientManager {
                     timeUnit = TimeUnit.MINUTES
                 )
             )
-            // Disable retry pro chunky (budeme je retryovat manuálně)
             .retryOnConnectionFailure(false)
             .build()
     }
 
-    /**
-     * Event listener pro monitoring HTTP/2 připojení
-     */
+
+     // Event listener pro monitoring HTTP/2 připojení
+
     private class Http2EventListener : okhttp3.EventListener() {
         override fun connectionAcquired(call: okhttp3.Call, connection: okhttp3.Connection) {
             Log.d(TAG, "Connection acquired: ${connection.protocol()}")
@@ -121,14 +117,14 @@ object Http2ClientManager {
         ) {
             Log.d(TAG, "Connected via: ${protocol ?: "unknown"}")
             if (protocol == Protocol.HTTP_2) {
-                Log.i(TAG, "✅ HTTP/2 connection established!")
+                Log.i(TAG, "HTTP/2 connection established!")
             }
         }
     }
 
-    /**
-     * Získá statistiky o použitých protokolech
-     */
+
+     // Získá statistiky o použitých protokolech
+
     fun getConnectionStats(): String {
         val pool = client.connectionPool
         return buildString {

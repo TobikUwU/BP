@@ -12,26 +12,18 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * Původní ModelDownloader - zachován pro kompatibilitu
- * Pro nové projekty použijte ParallelModelDownloader nebo DownloadManager
- * Aktualizováno pro HTTP/2 support
- */
+
 class ModelDownloader(private val context: Context) {
 
-    // HTTP/2 server URL (HTTPS na portu 3443)
     private val serverUrl = "https://192.168.50.96:3443"
 
-    // HTTP/2 klient
     private val httpClient = com.example.bp.download.Http2ClientManager.client
 
     companion object {
         private const val TAG = "ModelDownloader"
     }
 
-    /**
-     * Stáhne seznam dostupných modelů ze serveru (HTTP/2)
-     */
+
     suspend fun getAvailableModels(): List<ModelInfo> = withContext(Dispatchers.IO) {
         try {
             val request = okhttp3.Request.Builder()
@@ -60,10 +52,7 @@ class ModelDownloader(private val context: Context) {
                             sizeInMB = modelObj.getDouble("sizeInMB"),
                             modified = modelObj.getString("modified"),
                             chunked = modelObj.optBoolean("chunked", false),
-                            totalChunks = modelObj.optInt("totalChunks", 0),
-                            hasPreview = modelObj.optBoolean("hasPreview", false),
-                            previewName = modelObj.optString("previewName", null),
-                            previewSizeInMB = modelObj.optDouble("previewSizeInMB", 0.0)
+                            totalChunks = modelObj.optInt("totalChunks", 0)
                         )
                     )
                 }
@@ -77,10 +66,9 @@ class ModelDownloader(private val context: Context) {
         }
     }
 
-    /**
-     * Stáhne model ze serveru a uloží ho do interního úložiště
-     * S progress reportingem pro velké soubory (HTTP/2)
-     */
+
+    // Stáhne model ze serveru a uloží ho do interního úložiště
+
     suspend fun downloadModel(
         modelName: String,
         onProgress: ((DownloadProgress) -> Unit)? = null
@@ -157,36 +145,28 @@ class ModelDownloader(private val context: Context) {
         }
     }
 
-    /**
-     * Zkontroluje, zda model již existuje v interním úložišti
-     */
+
     fun isModelDownloaded(modelName: String): Boolean {
         val modelsDir = File(context.filesDir, "models")
         val modelFile = File(modelsDir, modelName)
         return modelFile.exists()
     }
 
-    /**
-     * Získá cestu k modelu v interním úložišti
-     */
+
     fun getModelPath(modelName: String): String? {
         val modelsDir = File(context.filesDir, "models")
         val modelFile = File(modelsDir, modelName)
         return if (modelFile.exists()) modelFile.absolutePath else null
     }
 
-    /**
-     * Získá velikost modelu v MB
-     */
+
     fun getModelSize(modelName: String): Long {
         val modelsDir = File(context.filesDir, "models")
         val modelFile = File(modelsDir, modelName)
         return if (modelFile.exists()) modelFile.length() / (1024 * 1024) else 0
     }
 
-    /**
-     * Smaže model z úložiště
-     */
+
     fun deleteModel(modelName: String): Boolean {
         return try {
             val modelsDir = File(context.filesDir, "models")
@@ -202,9 +182,8 @@ class ModelDownloader(private val context: Context) {
         }
     }
 
-    /**
-     * Vyčistí cache
-     */
+    // Vyčistí cache
+
     fun clearCache() {
         try {
             val cacheDir = File(context.cacheDir, "model_chunks")
@@ -215,9 +194,9 @@ class ModelDownloader(private val context: Context) {
         }
     }
 
-    /**
-     * Získá velikost cache
-     */
+
+    //  Získá velikost cache
+
     fun getCacheSize(): Long {
         val cacheDir = File(context.cacheDir, "model_chunks")
         return if (cacheDir.exists()) {
