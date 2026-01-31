@@ -9,8 +9,6 @@ import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
-import java.net.HttpURLConnection
-import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -34,8 +32,9 @@ class ParallelModelDownloader(private val context: Context) {
     // Download state manager
     private val downloadStateManager = DownloadStateManager(context)
 
-    // Active jobs tracking pro pause/resume
     private val activeJobs = ConcurrentHashMap<String, Job>()
+
+    private val pauseFlags = ConcurrentHashMap<String, Boolean>()
 
     // Konfigurace
     private var maxParallelDownloads = 3
@@ -66,6 +65,8 @@ class ParallelModelDownloader(private val context: Context) {
         onProgress: ((DownloadProgress) -> Unit)? = null
     ): File? = withContext(Dispatchers.IO) {
         try {
+            pauseFlags.remove(modelName)
+
             // Zkontroluj síťové podmínky
             val networkStats = bandwidthMonitor.networkStats.value
             Log.d(TAG, "Network: ${networkStats.connectionType}, Speed: ${networkStats.averageSpeed / 1024}KB/s")
@@ -139,6 +140,11 @@ class ParallelModelDownloader(private val context: Context) {
         outputFile: File,
         retryCount: Int = 0
     ): Int? = withContext(Dispatchers.IO) {
+        if (pauseFlags[modelName] == true) {
+            Log.d(TAG, "Chunk $chunkIndex skipped - download paused")
+            return@withContext null
+        }
+
         try {
             // Zkontroluj cache
             val cachedChunk = getCachedChunk(modelName, chunkIndex)
@@ -157,9 +163,6 @@ class ParallelModelDownloader(private val context: Context) {
             // Ověř hash
             if (!verifyChunkHash(chunkData, metadata.chunkHashes[chunkIndex])) {
                 Log.e(TAG, "Chunk $chunkIndex hash mismatch!")
-                Log.e(TAG, "Expected: ${metadata.chunkHashes[chunkIndex]}")
-                Log.e(TAG, "Got: ${MessageDigest.getInstance("SHA-256").digest(chunkData).joinToString("") { "%02x".format(it) }}")
-                Log.e(TAG, "Size: ${chunkData.size} bytes")
 
                 // Smaž vadnou cache
                 val cacheFile = File(cacheDir, "${modelName}_chunk_$chunkIndex")
@@ -174,7 +177,7 @@ class ParallelModelDownloader(private val context: Context) {
             saveCachedChunk(modelName, chunkIndex, chunkData)
 
             // Zapiš do souboru
-            synchronized(outputFile) {  // 🆕 Thread-safe zápis
+            synchronized(outputFile) {
                 RandomAccessFile(outputFile, "rw").use { raf ->
                     raf.seek(chunkIndex.toLong() * metadata.chunkSize)
                     raf.write(chunkData)
@@ -183,11 +186,14 @@ class ParallelModelDownloader(private val context: Context) {
 
             chunkData.size
 
+        } catch (e: CancellationException) {
+            Log.d(TAG, "Chunk $chunkIndex cancelled")
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "Chunk $chunkIndex retry $retryCount failed: ${e.message}")
 
             if (retryCount < maxRetries) {
-                // 🆕 Exponential backoff s jitter
+                // Exponential backoff s jitter
                 val baseDelay = retryDelayMs * (retryCount + 1)
                 val jitter = (Math.random() * 500).toLong()
                 delay(baseDelay + jitter)
@@ -378,20 +384,27 @@ class ParallelModelDownloader(private val context: Context) {
     }
 
 
-    // PAUSE/RESUME SUPPORT
 
     suspend fun pauseDownload(modelName: String): Boolean = withContext(Dispatchers.IO) {
         try {
+            Log.d(TAG, "Pausing download: $modelName")
+
+            pauseFlags[modelName] = true
+
+            // Wait a bit for current chunks to notice the flag
+            delay(100)
+
             val job = activeJobs[modelName]
-            if (job == null) {
-                Log.w(TAG, "No active download for $modelName")
-                return@withContext false
+            if (job != null) {
+                job.cancelAndJoin() // Wait for cancellation to complete
+                activeJobs.remove(modelName)
+                Log.d(TAG, "Download job cancelled for $modelName")
+            } else {
+                Log.w(TAG, "No active download job found for $modelName")
             }
 
-            job.cancel()
-            activeJobs.remove(modelName)
-
-            Log.d(TAG, "Download paused: $modelName")
+            // State is already saved by downloadModelWithCheckpoint's catch block
+            Log.d(TAG, "Download paused successfully: $modelName")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to pause download", e)
@@ -404,6 +417,10 @@ class ParallelModelDownloader(private val context: Context) {
         onProgress: ((DownloadProgress) -> Unit)?
     ): File? = withContext(Dispatchers.IO) {
         try {
+            Log.d(TAG, "Attempting to resume download: $modelName")
+
+            pauseFlags.remove(modelName)
+
             // Načti uložený stav
             val state = downloadStateManager.getDownloadState(modelName)
             if (state == null) {
@@ -437,9 +454,14 @@ class ParallelModelDownloader(private val context: Context) {
 
     suspend fun cancelDownload(modelName: String): Boolean = withContext(Dispatchers.IO) {
         try {
+            Log.d(TAG, "Cancelling download: $modelName")
+
+            pauseFlags[modelName] = true
+
             // Cancel aktivní job
-            activeJobs[modelName]?.cancel()
+            activeJobs[modelName]?.cancelAndJoin()
             activeJobs.remove(modelName)
+            pauseFlags.remove(modelName)
 
             // Smaž tmp soubor
             val state = downloadStateManager.getDownloadState(modelName)
@@ -469,7 +491,9 @@ class ParallelModelDownloader(private val context: Context) {
         metadata: ModelMetadata,
         onProgress: ((DownloadProgress) -> Unit)?,
         existingState: DownloadStateManager.DownloadStateData? = null
-    ): File? = withContext(Dispatchers.IO) {
+    ): File? = coroutineScope {
+        val downloadScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
         val outputFile = File(modelsDir, modelName)
         val tempFile = existingState?.tmpFilePath?.let { File(it) }
             ?: File(modelsDir, "$modelName.tmp")
@@ -494,12 +518,17 @@ class ParallelModelDownloader(private val context: Context) {
         // Semafora pro omezení paralelních stahování
         val semaphore = Semaphore(maxParallelDownloads)
 
-        val downloadJob = coroutineContext[Job]!!
+        val downloadJob = downloadScope.coroutineContext[Job]!!
         activeJobs[modelName] = downloadJob
 
         val jobs = chunksToDownload.map { chunkIndex ->
-            async {
+            downloadScope.async {
                 semaphore.withPermit {
+                    if (pauseFlags[modelName] == true) {
+                        Log.d(TAG, "Chunk $chunkIndex skipped - pause requested")
+                        return@async null
+                    }
+
                     val startTime = System.currentTimeMillis()
 
                     downloadChunkWithRetry(
@@ -557,7 +586,8 @@ class ParallelModelDownloader(private val context: Context) {
         try {
             jobs.awaitAll()
         } catch (e: CancellationException) {
-            Log.d(TAG, "Download paused by user")
+            // 🔧 FIX: Graceful pause - save state before returning
+            Log.d(TAG, "Download paused/cancelled - saving state")
             downloadStateManager.saveDownloadState(
                 modelName = modelName,
                 completedChunks = completedChunks,
@@ -569,10 +599,12 @@ class ParallelModelDownloader(private val context: Context) {
                 tmpFilePath = tempFile.absolutePath
             )
             activeJobs.remove(modelName)
-            return@withContext null
+            downloadScope.cancel() // Clean up the scope
+            return@coroutineScope null
+        } finally {
+            activeJobs.remove(modelName)
+            downloadScope.cancel()
         }
-
-        activeJobs.remove(modelName)
 
         if (failedChunks.isNotEmpty()) {
             Log.e(TAG, "Failed chunks: ${failedChunks.keys}")
@@ -586,7 +618,7 @@ class ParallelModelDownloader(private val context: Context) {
                 metadata = metadata,
                 tmpFilePath = tempFile.absolutePath
             )
-            return@withContext null
+            return@coroutineScope null
         }
 
         Log.d(TAG, "Verifying integrity...")
@@ -596,7 +628,7 @@ class ParallelModelDownloader(private val context: Context) {
             Log.e(TAG, "Hash mismatch!")
             tempFile.delete()
             downloadStateManager.deleteDownloadState(modelName)
-            return@withContext null
+            return@coroutineScope null
         }
 
         if (outputFile.exists()) outputFile.delete()
