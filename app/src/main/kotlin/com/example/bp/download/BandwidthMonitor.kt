@@ -8,7 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 
-  // Monitoruje síťovou rychlost a typ připojení
+// Monitoruje síťovou rychlost a typ připojení
 
 class BandwidthMonitor(private val context: Context) {
 
@@ -50,7 +50,7 @@ class BandwidthMonitor(private val context: Context) {
         val network = connectivityManager.activeNetwork
         if (network == null) {
             Log.w("BandwidthMonitor", "No active network found")
-            // 🆕 Fallback: zkus získat network info jinak
+            // Fallback: zkus získat network info jinak
             try {
                 val networkInfo = connectivityManager.activeNetworkInfo
                 if (networkInfo?.isConnected == true) {
@@ -81,15 +81,18 @@ class BandwidthMonitor(private val context: Context) {
                 Log.d("BandwidthMonitor", "Detected: WIFI")
                 ConnectionType.WIFI
             }
+
             capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> {
                 Log.d("BandwidthMonitor", "Detected: ETHERNET")
                 ConnectionType.ETHERNET
             }
+
             capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> {
                 val type = detectCellularGeneration(capabilities)
                 Log.d("BandwidthMonitor", "Detected: $type")
                 type
             }
+
             else -> {
                 Log.w("BandwidthMonitor", "Unknown transport type")
                 ConnectionType.OFFLINE
