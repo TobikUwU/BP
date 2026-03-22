@@ -15,7 +15,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 
-class ParallelModelDownloader(private val context: Context) {
+class ParallelModelDownloader(
+    private val context: Context,
+    private val bandwidthMonitor: BandwidthMonitor = BandwidthMonitor(context)
+) {
 
     private val serverUrl = "https://192.168.50.96:3443"
     private val cacheDir = File(context.cacheDir, "model_chunks")
@@ -25,9 +28,6 @@ class ParallelModelDownloader(private val context: Context) {
 
     // Fallback na původní downloader
     private val fallbackDownloader = ModelDownloader(context)
-
-    // Bandwidth monitor
-    private val bandwidthMonitor = BandwidthMonitor(context)
 
     // Download state manager
     private val downloadStateManager = DownloadStateManager(context)
@@ -66,6 +66,7 @@ class ParallelModelDownloader(private val context: Context) {
     ): File? = withContext(Dispatchers.IO) {
         try {
             pauseFlags.remove(modelName)
+            bandwidthMonitor.refreshNetworkStats()
 
             // Zkontroluj síťové podmínky
             val networkStats = bandwidthMonitor.networkStats.value
@@ -149,7 +150,8 @@ class ParallelModelDownloader(private val context: Context) {
             // Zkontroluj cache
             val cachedChunk = getCachedChunk(modelName, chunkIndex)
             val chunkData = if (cachedChunk != null &&
-                verifyChunkHash(cachedChunk, metadata.chunkHashes[chunkIndex])) {
+                verifyChunkHash(cachedChunk, metadata.chunkHashes[chunkIndex])
+            ) {
                 Log.d(TAG, "Using cached chunk $chunkIndex")
                 cachedChunk
             } else {
@@ -288,13 +290,19 @@ class ParallelModelDownloader(private val context: Context) {
 
                         if (originalSize != null && compressedSize != null && originalSize > 0) {
                             val savings = ((1 - compressedSize.toFloat() / originalSize) * 100).toInt()
-                            Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: saved ${savings}% bandwidth (${compressedSize / 1024}KB → ${decompressed.size / 1024}KB)")
+                            Log.d(
+                                TAG,
+                                "Chunk $chunkIndex via ${response.protocol}: saved ${savings}% bandwidth (${compressedSize / 1024}KB → ${decompressed.size / 1024}KB)"
+                            )
                         }
 
                         decompressed
                     } else {
                         val responseBytes = response.body?.bytes() ?: return@withContext null
-                        Log.d(TAG, "Chunk $chunkIndex via ${response.protocol}: ${responseBytes.size / 1024}KB (uncompressed)")
+                        Log.d(
+                            TAG,
+                            "Chunk $chunkIndex via ${response.protocol}: ${responseBytes.size / 1024}KB (uncompressed)"
+                        )
                         responseBytes
                     }
 
@@ -382,7 +390,6 @@ class ParallelModelDownloader(private val context: Context) {
         return fallbackDownloader.getCacheSize() +
                 cacheDir.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
     }
-
 
 
     suspend fun pauseDownload(modelName: String): Boolean = withContext(Dispatchers.IO) {
@@ -493,6 +500,7 @@ class ParallelModelDownloader(private val context: Context) {
         existingState: DownloadStateManager.DownloadStateData? = null
     ): File? = coroutineScope {
         val downloadScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val progressLock = Any()
 
         val outputFile = File(modelsDir, modelName)
         val tempFile = existingState?.tmpFilePath?.let { File(it) }
@@ -504,7 +512,9 @@ class ParallelModelDownloader(private val context: Context) {
         }
 
         // Progress tracking
-        val completedChunks = existingState?.completedChunks?.toMutableSet() ?: mutableSetOf()
+        val completedChunks = ConcurrentHashMap.newKeySet<Int>().apply {
+            existingState?.completedChunks?.let { addAll(it) }
+        }
         val downloadedChunks = AtomicInteger(completedChunks.size)
         val downloadedBytes = AtomicLong(existingState?.downloadedBytes ?: 0)
         val failedChunks = ConcurrentHashMap<Int, Int>()
@@ -539,9 +549,14 @@ class ParallelModelDownloader(private val context: Context) {
                     )?.also { chunkSize ->
                         completedChunks.add(chunkIndex)
                         downloadedChunks.incrementAndGet()
-                        downloadedBytes.addAndGet(chunkSize.toLong())
+                        val totalDownloadedBytes = downloadedBytes.addAndGet(chunkSize.toLong())
 
-                        downloadStateManager.updateCompletedChunks(modelName, chunkIndex)
+                        downloadStateManager.updateProgress(
+                            modelName = modelName,
+                            completedChunks = completedChunks.toSet(),
+                            downloadedBytes = totalDownloadedBytes,
+                            isPaused = false
+                        )
 
                         // Vypočti rychlost
                         val elapsed = System.currentTimeMillis() - startTime
@@ -552,28 +567,30 @@ class ParallelModelDownloader(private val context: Context) {
 
                         // Update progress
                         val currentTime = System.currentTimeMillis()
-                        val timeDiff = currentTime - lastProgressTime
+                        synchronized(progressLock) {
+                            val timeDiff = currentTime - lastProgressTime
 
-                        if (timeDiff > 300) {
-                            val currentBytes = downloadedBytes.get()
-                            val bytesDiff = currentBytes - lastDownloadedBytes
-                            val speed = if (timeDiff > 0) (bytesDiff * 1000) / timeDiff else 0
-                            val remainingBytes = metadata.totalSize - currentBytes
-                            val eta = if (speed > 0) remainingBytes / speed else 0
+                            if (timeDiff > 300) {
+                                val currentBytes = downloadedBytes.get()
+                                val bytesDiff = currentBytes - lastDownloadedBytes
+                                val speed = if (timeDiff > 0) (bytesDiff * 1000) / timeDiff else 0
+                                val remainingBytes = metadata.totalSize - currentBytes
+                                val eta = if (speed > 0) remainingBytes / speed else 0
 
-                            onProgress?.invoke(
-                                DownloadProgress(
-                                    downloadedChunks = downloadedChunks.get(),
-                                    totalChunks = metadata.totalChunks,
-                                    downloadedBytes = currentBytes,
-                                    totalBytes = metadata.totalSize,
-                                    currentSpeed = speed,
-                                    eta = eta
+                                onProgress?.invoke(
+                                    DownloadProgress(
+                                        downloadedChunks = downloadedChunks.get(),
+                                        totalChunks = metadata.totalChunks,
+                                        downloadedBytes = currentBytes,
+                                        totalBytes = metadata.totalSize,
+                                        currentSpeed = speed,
+                                        eta = eta
+                                    )
                                 )
-                            )
 
-                            lastProgressTime = currentTime
-                            lastDownloadedBytes = currentBytes
+                                lastProgressTime = currentTime
+                                lastDownloadedBytes = currentBytes
+                            }
                         }
                     } ?: run {
                         failedChunks[chunkIndex] = (failedChunks[chunkIndex] ?: 0) + 1
@@ -590,7 +607,7 @@ class ParallelModelDownloader(private val context: Context) {
             Log.d(TAG, "Download paused/cancelled - saving state")
             downloadStateManager.saveDownloadState(
                 modelName = modelName,
-                completedChunks = completedChunks,
+                completedChunks = completedChunks.toSet(),
                 totalChunks = metadata.totalChunks,
                 downloadedBytes = downloadedBytes.get(),
                 totalBytes = metadata.totalSize,
@@ -610,7 +627,7 @@ class ParallelModelDownloader(private val context: Context) {
             Log.e(TAG, "Failed chunks: ${failedChunks.keys}")
             downloadStateManager.saveDownloadState(
                 modelName = modelName,
-                completedChunks = completedChunks,
+                completedChunks = completedChunks.toSet(),
                 totalChunks = metadata.totalChunks,
                 downloadedBytes = downloadedBytes.get(),
                 totalBytes = metadata.totalSize,

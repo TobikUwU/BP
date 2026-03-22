@@ -8,8 +8,8 @@ import java.io.File
 
 class DownloadManager(private val context: Context) {
 
-    private val parallelDownloader = ParallelModelDownloader(context)
     private val bandwidthMonitor = BandwidthMonitor(context)
+    private val parallelDownloader = ParallelModelDownloader(context, bandwidthMonitor)
     private val downloadStateManager = DownloadStateManager(context)
 
     var debugForceParallel = false
@@ -42,6 +42,7 @@ class DownloadManager(private val context: Context) {
             val modelName: String,
             val progress: DownloadProgress
         ) : DownloadState()
+
         data class Completed(val modelName: String, val file: File) : DownloadState()
         data class Failed(val modelName: String, val error: String) : DownloadState()
         data class Paused(val modelName: String, val progress: DownloadProgress) : DownloadState()
@@ -65,11 +66,13 @@ class DownloadManager(private val context: Context) {
     ): File? {
         val strategy = determineOptimalStrategy(modelInfo)
 
-        Log.d(TAG, """
+        Log.d(
+            TAG, """
             Download strategy for ${modelInfo.name}:
             - Parallel: ${strategy.useParallel}
             - Network: ${bandwidthMonitor.networkStats.value.connectionType}
-        """.trimIndent())
+        """.trimIndent()
+        )
 
         _currentDownload.value = DownloadState.Preparing(modelInfo.name)
 
@@ -84,6 +87,7 @@ class DownloadManager(private val context: Context) {
                         onProgress?.invoke(progress)
                     }
                 }
+
                 else -> {
                     // Fallback na sekvenční stahování
                     parallelDownloader.downloadModel(modelInfo.name, onProgress)
@@ -139,6 +143,7 @@ class DownloadManager(private val context: Context) {
       - Metered connection
      */
     private fun determineOptimalStrategy(modelInfo: ModelInfo): DownloadStrategy {
+        bandwidthMonitor.refreshNetworkStats()
         val networkStats = bandwidthMonitor.networkStats.value
         val modelSizeBytes = (modelInfo.sizeInMB * 1024 * 1024).toLong()
 
@@ -152,6 +157,7 @@ class DownloadManager(private val context: Context) {
                 BandwidthMonitor.ConnectionType.OFFLINE -> false  // Sekvenční při offline
                 BandwidthMonitor.ConnectionType.WIFI,
                 BandwidthMonitor.ConnectionType.ETHERNET -> true
+
                 BandwidthMonitor.ConnectionType.CELLULAR_5G -> modelSizeBytes > 10 * 1024 * 1024
                 BandwidthMonitor.ConnectionType.CELLULAR_4G -> modelSizeBytes > 50 * 1024 * 1024
                 else -> false
@@ -165,12 +171,14 @@ class DownloadManager(private val context: Context) {
 
 
     fun shouldShowMeteredWarning(modelInfo: ModelInfo): Boolean {
+        bandwidthMonitor.refreshNetworkStats()
         val modelSizeBytes = (modelInfo.sizeInMB * 1024 * 1024).toLong()
         return bandwidthMonitor.shouldWarnAboutMeteredConnection(modelSizeBytes)
     }
 
 
     fun getDownloadRecommendation(modelInfo: ModelInfo): String {
+        bandwidthMonitor.refreshNetworkStats()
         val strategy = determineOptimalStrategy(modelInfo)
         val networkStats = bandwidthMonitor.networkStats.value
 
@@ -243,6 +251,7 @@ class DownloadManager(private val context: Context) {
     }
 
     fun getNetworkStats(): BandwidthMonitor.NetworkStats {
+        bandwidthMonitor.refreshNetworkStats()
         return bandwidthMonitor.networkStats.value
     }
 

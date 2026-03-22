@@ -6,11 +6,14 @@ import android.net.NetworkCapabilities
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlin.math.roundToLong
 
 
 // Monitoruje síťovou rychlost a typ připojení
 
 class BandwidthMonitor(private val context: Context) {
+
+    private val speedLock = Any()
 
     data class NetworkStats(
         val connectionType: ConnectionType,
@@ -42,6 +45,10 @@ class BandwidthMonitor(private val context: Context) {
 
     private val speedHistory = mutableListOf<Long>()
     private val maxHistorySize = 20
+
+    init {
+        refreshNetworkStats()
+    }
 
     fun getConnectionType(): ConnectionType {
         val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
@@ -120,29 +127,45 @@ class BandwidthMonitor(private val context: Context) {
         return connectivityManager.isActiveNetworkMetered
     }
 
-    fun updateSpeed(bytesPerSecond: Long) {
-        speedHistory.add(bytesPerSecond)
-        if (speedHistory.size > maxHistorySize) {
-            speedHistory.removeAt(0)
-        }
-
-        val avgSpeed = speedHistory.average().toLong()
+    fun refreshNetworkStats() {
         val connectionType = getConnectionType()
         val isMetered = isMeteredConnection()
+        val avgSpeed: Long
+        val currentSpeed: Long
 
-        val parallelism = when {
-            avgSpeed > 10_000_000 -> 8
-            avgSpeed > 5_000_000 -> 5
-            avgSpeed > 1_000_000 -> 3
-            else -> 1
+        synchronized(speedLock) {
+            avgSpeed = if (speedHistory.isEmpty()) 0 else speedHistory.average().roundToLong()
+            currentSpeed = speedHistory.lastOrNull() ?: 0
         }
+
+        _networkStats.value = NetworkStats(
+            connectionType = connectionType,
+            averageSpeed = avgSpeed,
+            currentSpeed = currentSpeed,
+            isMetered = isMetered,
+            recommendedParallelism = recommendedParallelismFor(avgSpeed)
+        )
+    }
+
+    fun updateSpeed(bytesPerSecond: Long) {
+        val avgSpeed: Long
+        synchronized(speedLock) {
+            speedHistory.add(bytesPerSecond)
+            if (speedHistory.size > maxHistorySize) {
+                speedHistory.removeAt(0)
+            }
+            avgSpeed = speedHistory.average().roundToLong()
+        }
+
+        val connectionType = getConnectionType()
+        val isMetered = isMeteredConnection()
 
         _networkStats.value = NetworkStats(
             connectionType = connectionType,
             averageSpeed = avgSpeed,
             currentSpeed = bytesPerSecond,
             isMetered = isMetered,
-            recommendedParallelism = parallelism
+            recommendedParallelism = recommendedParallelismFor(avgSpeed)
         )
     }
 
@@ -150,5 +173,14 @@ class BandwidthMonitor(private val context: Context) {
         return _networkStats.value.isMetered &&
                 _networkStats.value.connectionType != ConnectionType.WIFI &&
                 fileSize > 50 * 1024 * 1024
+    }
+
+    private fun recommendedParallelismFor(avgSpeed: Long): Int {
+        return when {
+            avgSpeed > 10_000_000 -> 8
+            avgSpeed > 5_000_000 -> 5
+            avgSpeed > 1_000_000 -> 3
+            else -> 1
+        }
     }
 }

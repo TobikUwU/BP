@@ -23,7 +23,7 @@ class DownloadStateManager(context: Context) {
     }
 
 
-     // Data struktura pro uložený stav downloadu
+    // Data struktura pro uložený stav downloadu
 
     data class DownloadStateData(
         val modelName: String,
@@ -118,23 +118,27 @@ class DownloadStateManager(context: Context) {
     }
 
     @Synchronized
-    fun updateCompletedChunks(modelName: String, chunkIndex: Int) {
+    fun updateProgress(
+        modelName: String,
+        completedChunks: Set<Int>,
+        downloadedBytes: Long,
+        isPaused: Boolean
+    ) {
         try {
             val state = getDownloadState(modelName) ?: return
-            val updatedChunks = state.completedChunks + chunkIndex
 
             saveDownloadState(
                 modelName = state.modelName,
-                completedChunks = updatedChunks,
+                completedChunks = completedChunks,
                 totalChunks = state.totalChunks,
-                downloadedBytes = state.downloadedBytes,
+                downloadedBytes = downloadedBytes,
                 totalBytes = state.totalBytes,
-                isPaused = state.isPaused,
+                isPaused = isPaused,
                 metadata = state.metadata,
                 tmpFilePath = state.tmpFilePath
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to update completed chunks", e)
+            Log.e(TAG, "Failed to update download progress", e)
         }
     }
 
