@@ -128,7 +128,7 @@ class DownloadService : Service() {
         currentDownloadJob = serviceScope.launch {
             try {
                 val downloadManager = DownloadManager(applicationContext)
-                val modelInfo = ModelInfo(modelName, 0.0, "", false, 0)
+                val modelInfo = ModelInfo(id = modelName, name = modelName, createdAt = "", lodCount = 0, totalSizeInMB = 0.0)
 
                 downloadManager.downloadModelSmart(modelInfo) { progress ->
                     updateNotification(
@@ -372,3 +372,4 @@ class DownloadService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 }
+

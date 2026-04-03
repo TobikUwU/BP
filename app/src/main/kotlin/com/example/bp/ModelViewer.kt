@@ -7,28 +7,83 @@ import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceView
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
-import com.google.android.filament.*
+import com.google.android.filament.Camera
+import com.google.android.filament.Engine
+import com.google.android.filament.EntityManager
+import com.google.android.filament.Renderer
+import com.google.android.filament.Scene
+import com.google.android.filament.Skybox
+import com.google.android.filament.SwapChain
+import com.google.android.filament.View
+import com.google.android.filament.Viewport
 import com.google.android.filament.android.DisplayHelper
 import com.google.android.filament.android.UiHelper
-import com.google.android.filament.gltfio.*
-import com.google.android.filament.utils.*
-import kotlinx.coroutines.*
+import com.google.android.filament.gltfio.AssetLoader
+import com.google.android.filament.gltfio.FilamentAsset
+import com.google.android.filament.gltfio.Gltfio
+import com.google.android.filament.gltfio.ResourceLoader
+import com.google.android.filament.gltfio.UbershaderProvider
+import com.google.android.filament.utils.KTX1Loader
+import com.google.android.filament.utils.Utils
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.sqrt
 
-// Helper funkce pro načtení asset souboru jako ByteBuffer
 private fun loadAssetAsByteBuffer(context: Context, assetName: String): ByteBuffer {
     context.assets.open(assetName).use { input ->
-        val bytes = input.readBytes()
-        return ByteBuffer.wrap(bytes)
+        return ByteBuffer.wrap(input.readBytes())
+    }
+}
+
+private fun loadFileAsByteBuffer(file: File): ByteBuffer {
+    val bytes = file.readBytes()
+    return ByteBuffer.allocateDirect(bytes.size)
+        .order(ByteOrder.nativeOrder())
+        .put(bytes)
+        .apply { flip() }
+}
+
+private fun addResourceData(resourceLoader: ResourceLoader, uri: String, buffer: ByteBuffer): Boolean {
+    val method = resourceLoader.javaClass.methods.firstOrNull {
+        it.name == "addResourceData" && it.parameterCount == 2
+    } ?: return false
+
+    method.invoke(resourceLoader, uri, buffer)
+    return true
+}
+
+private fun provideExternalResources(resourceLoader: ResourceLoader, asset: FilamentAsset, modelFile: File) {
+    val baseDir = modelFile.parentFile ?: return
+    asset.resourceUris.forEach { uri ->
+        val resourceFile = File(baseDir, uri)
+        if (!resourceFile.exists()) {
+            Log.w("ModelViewer", "Missing external resource: ${resourceFile.absolutePath}")
+            return@forEach
+        }
+
+        val buffer = loadFileAsByteBuffer(resourceFile)
+        val added = addResourceData(resourceLoader, uri, buffer)
+        if (!added) {
+            Log.w("ModelViewer", "ResourceLoader.addResourceData not available for $uri")
+        }
     }
 }
 
@@ -56,7 +111,6 @@ private class FilamentState(
         val angleXRad = cameraAngleX * PI / 180.0
         val angleYRad = cameraAngleY * PI / 180.0
 
-        // Pozice kamery
         val eyeX = modelCenter[0] + cameraDistance * cos(angleYRad) * sin(angleXRad)
         val eyeY = modelCenter[1] + cameraDistance * sin(angleYRad)
         val eyeZ = modelCenter[2] + cameraDistance * cos(angleYRad) * cos(angleXRad)
@@ -69,34 +123,20 @@ private class FilamentState(
     }
 
     fun swapModel(newAsset: FilamentAsset) {
-        // Odstraň staré entity ze scény
-        currentAsset?.let { oldAsset ->
-            Log.d("ModelViewer", "Removing old model entities...")
-            scene.removeEntities(oldAsset.entities)
-        }
-
-        // Přidej nové entity
-        Log.d("ModelViewer", "Adding new model entities...")
+        currentAsset?.let { scene.removeEntities(it.entities) }
         scene.addEntities(newAsset.entities)
 
-        // Aktualizuj střed modelu
-        val c = newAsset.boundingBox.center
-        modelCenter[0] = c[0]
-        modelCenter[1] = c[1]
-        modelCenter[2] = c[2]
+        val center = newAsset.boundingBox.center
+        modelCenter[0] = center[0]
+        modelCenter[1] = center[1]
+        modelCenter[2] = center[2]
 
-        // Vypočítej optimální vzdálenost kamery podle velikosti modelu
         val halfExtent = newAsset.boundingBox.halfExtent
         val maxExtent = maxOf(halfExtent[0], halfExtent[1], halfExtent[2])
-        cameraDistance = (maxExtent * 3.5).coerceAtLeast(6.0)  // Minimálně 6.0
-
-        Log.d("ModelViewer", "Model size: ${maxExtent * 2}, Camera distance: $cameraDistance")
-
+        cameraDistance = (maxExtent * 3.5).coerceAtLeast(6.0)
         updateCamera()
 
         currentAsset = newAsset
-
-        Log.d("ModelViewer", "Model swap completed!")
     }
 }
 
@@ -114,116 +154,62 @@ fun ModelViewer(
     var filamentState by remember { mutableStateOf<FilamentState?>(null) }
 
     fun loadModel(pathToLoad: String, state: FilamentState) {
-        Log.d("ModelViewer", "Hot-swap: loading new model: $pathToLoad")
-
         scope.launch {
             try {
+                val modelFile = File(pathToLoad)
                 val buffer = withContext(Dispatchers.IO) {
-                    val file = File(pathToLoad)
-                    if (!file.exists()) {
+                    if (!modelFile.exists()) {
                         throw IllegalArgumentException("Model soubor neexistuje: $pathToLoad")
                     }
-
-                    val fileSize = file.length()
-                    Log.d("ModelViewer", "Loading model from file: ${fileSize / (1024 * 1024)} MB")
-
-                    FileInputStream(file).use { inputStream ->
-                        val chunkSize = 1024 * 1024 // 1 MB chunks
-                        val totalBytes = fileSize.toInt()
-                        val buffer = ByteBuffer.allocateDirect(totalBytes)
-                            .order(ByteOrder.nativeOrder())
-
-                        val chunk = ByteArray(chunkSize)
-                        var bytesRead: Int
-                        var totalRead = 0
-
-                        while (inputStream.read(chunk).also { bytesRead = it } != -1) {
-                            buffer.put(chunk, 0, bytesRead)
-                            totalRead += bytesRead
-
-                            if (totalRead % (10 * 1024 * 1024) == 0) {
-                                Log.d("ModelViewer", "Buffer loaded: ${totalRead / (1024 * 1024)} MB / ${totalBytes / (1024 * 1024)} MB")
-                            }
-                        }
-
-                        buffer.flip()
-                        buffer
-                    }
+                    loadFileAsByteBuffer(modelFile)
                 }
 
-                Log.d("ModelViewer", "Creating asset from buffer...")
                 val asset = state.assetLoader.createAsset(buffer)
-
-                asset?.let {
-                    val resourceCount = it.resourceUris.size
-
-                    if (resourceCount == 0) {
-                        Log.d("ModelViewer", "No external resources - loading synchronously")
-                        state.resourceLoader.loadResources(it)
-                        it.releaseSourceData()
-                        state.swapModel(it)
-                        loadedPath = pathToLoad
-                        isLoading = false
-                        state.isLoadingAsset = false
-                        Log.d("ModelViewer", "Model loaded and swapped: $pathToLoad")
-                        onModelLoaded?.invoke()
-
-                        // Zpracuj queued path
-                        val nextPath = state.queuedModelPath
-                        if (nextPath != null) {
-                            state.queuedModelPath = null
-                            val callback = state.onQueuedPathReady
-                            state.onQueuedPathReady = null
-                            callback?.invoke(nextPath)
-                        }
-                    } else {
-                        Log.d("ModelViewer", "Loading $resourceCount external resources asynchronously")
-                        state.resourceLoader.asyncBeginLoad(it)
-                        state.isLoadingAsset = true
-
-                        it.releaseSourceData()
-                        state.swapModel(it)
-                        loadedPath = pathToLoad
-                        isLoading = false
-                        state.isLoadingAsset = false
-                        Log.d("ModelViewer", "Model swapped, textures loading in background: $pathToLoad")
-                        onModelLoaded?.invoke()
-
-                        val nextPath = state.queuedModelPath
-                        if (nextPath != null) {
-                            state.queuedModelPath = null
-                            val callback = state.onQueuedPathReady
-                            state.onQueuedPathReady = null
-                            callback?.invoke(nextPath)
-                        }
-                    }
-                } ?: run {
+                if (asset == null) {
                     isLoading = false
                     state.isLoadingAsset = false
-                    Log.e("ModelViewer", "Failed to create asset from buffer")
+                    Log.e("ModelViewer", "Failed to create asset from $pathToLoad")
+                    return@launch
                 }
-            } catch (e: OutOfMemoryError) {
-                Log.e("ModelViewer", "Out of memory loading model!", e)
+
+                withContext(Dispatchers.IO) {
+                    if (asset.resourceUris.isNotEmpty()) {
+                        provideExternalResources(state.resourceLoader, asset, modelFile)
+                    }
+                    state.resourceLoader.loadResources(asset)
+                    asset.releaseSourceData()
+                }
+
+                state.swapModel(asset)
+                loadedPath = pathToLoad
                 isLoading = false
+                state.isLoadingAsset = false
+                onModelLoaded?.invoke()
+
+                val nextPath = state.queuedModelPath
+                if (nextPath != null) {
+                    state.queuedModelPath = null
+                    val callback = state.onQueuedPathReady
+                    state.onQueuedPathReady = null
+                    callback?.invoke(nextPath)
+                }
             } catch (e: CancellationException) {
-                Log.d("ModelViewer", "Model loading cancelled")
                 isLoading = false
+                state.isLoadingAsset = false
                 throw e
             } catch (e: Exception) {
                 Log.e("ModelViewer", "Error loading model", e)
-                e.printStackTrace()
                 isLoading = false
+                state.isLoadingAsset = false
             }
         }
     }
 
     LaunchedEffect(modelPath, filamentState) {
         val state = filamentState ?: return@LaunchedEffect
-
         if (modelPath == loadedPath) return@LaunchedEffect
 
         if (isLoading || state.isLoadingAsset) {
-            Log.d("ModelViewer", "Loading in progress, queueing: $modelPath")
             state.queuedModelPath = modelPath
             state.onQueuedPathReady = { queuedPath ->
                 if (queuedPath != loadedPath) {
@@ -235,20 +221,16 @@ fun ModelViewer(
         }
 
         isLoading = true
+        state.isLoadingAsset = true
         loadModel(modelPath, state)
     }
 
     DisposableEffect(Unit) {
-        onDispose {
-            Log.d("ModelViewer", "ModelViewer disposed")
-        }
+        onDispose { Log.d("ModelViewer", "ModelViewer disposed") }
     }
 
     AndroidView(
-        factory = { ctx ->
-
-            Filament.init()
-            Gltfio.init()
+        factory = { ctx ->            Gltfio.init()
             Utils.init()
 
             val engine = Engine.create()
@@ -260,43 +242,26 @@ fun ModelViewer(
             view.scene = scene
             view.camera = camera
 
-            // ---------- IBL & SKYBOX ----------
             try {
-                // Načti IBL a Skybox z assets
                 val iblBuffer = loadAssetAsByteBuffer(ctx, "qwantani_ibl.ktx")
                 val skyboxBuffer = loadAssetAsByteBuffer(ctx, "qwantani_skybox.ktx")
-
-                // Vytvoř IndirectLight (IBL) z KTX souboru
                 val iblBundle = KTX1Loader.createIndirectLight(engine, iblBuffer)
                 scene.indirectLight = iblBundle.indirectLight
                 scene.indirectLight?.intensity = 30000f
-
-                // Vytvoř Skybox z KTX souboru
                 val skyboxBundle = KTX1Loader.createSkybox(engine, skyboxBuffer)
                 scene.skybox = skyboxBundle.skybox
-
-                Log.d("ModelViewer", "IBL and Skybox (qwantani) loaded successfully")
             } catch (e: Exception) {
                 Log.e("ModelViewer", "Failed to load IBL/Skybox, using fallback", e)
-                e.printStackTrace()
-                // Fallback: jednoduchý modrý skybox
-                scene.skybox = Skybox.Builder()
-                    .color(0.53f, 0.81f, 0.92f, 1f)
-                    .build(engine)
+                scene.skybox = Skybox.Builder().color(0.53f, 0.81f, 0.92f, 1f).build(engine)
             }
 
-            // LOADERS
             val materialProvider = UbershaderProvider(engine)
             val assetLoader = AssetLoader(engine, materialProvider, EntityManager.get())
             val resourceLoader = ResourceLoader(engine)
 
-            val state = FilamentState(
-                engine, renderer, scene, view, camera,
-                assetLoader, resourceLoader
-            )
+            val state = FilamentState(engine, renderer, scene, view, camera, assetLoader, resourceLoader)
             filamentState = state
 
-            // TOUCH CONTROL
             var lastTouchX = 0f
             var lastTouchY = 0f
             var lastPinchDistance = 0f
@@ -306,17 +271,15 @@ fun ModelViewer(
                 if (event.pointerCount < 2) return 0f
                 val dx = event.getX(0) - event.getX(1)
                 val dy = event.getY(0) - event.getY(1)
-                return kotlin.math.sqrt(dx * dx + dy * dy)
+                return sqrt(dx * dx + dy * dy)
             }
 
-            // SURFACE
             val surfaceView = SurfaceView(ctx)
             val uiHelper = UiHelper(UiHelper.ContextErrorPolicy.DONT_CHECK)
             val displayHelper = DisplayHelper(ctx)
-
             var swapChain: SwapChain? = null
 
-            surfaceView.setOnTouchListener { v, event ->
+            surfaceView.setOnTouchListener { viewRef, event ->
                 when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         lastTouchX = event.x
@@ -335,26 +298,20 @@ fun ModelViewer(
                         when (event.pointerCount) {
                             2 -> {
                                 if (isPinching) {
-                                    // 2 prsty = zoom
                                     val currentDistance = getPinchDistance(event)
                                     if (lastPinchDistance > 0 && currentDistance > 0) {
                                         val scale = lastPinchDistance / currentDistance
-                                        state.cameraDistance *= scale
-                                        state.cameraDistance = state.cameraDistance.coerceIn(1.0, 100.0)
+                                        state.cameraDistance = (state.cameraDistance * scale).coerceIn(1.0, 100.0)
                                         lastPinchDistance = currentDistance
                                     }
                                 }
                             }
                             1 -> {
                                 if (!isPinching) {
-                                    // 1 prst = rotace
                                     val dx = event.x - lastTouchX
                                     val dy = event.y - lastTouchY
-
                                     state.cameraAngleX += dx * 0.3
-                                    state.cameraAngleY -= dy * 0.3
-                                    state.cameraAngleY = state.cameraAngleY.coerceIn(-89.0, 89.0)
-
+                                    state.cameraAngleY = (state.cameraAngleY - dy * 0.3).coerceIn(-89.0, 89.0)
                                     lastTouchX = event.x
                                     lastTouchY = event.y
                                 }
@@ -367,7 +324,7 @@ fun ModelViewer(
                         isPinching = false
                         lastPinchDistance = 0f
                         if (event.pointerCount == 1) {
-                            v.performClick()
+                            viewRef.performClick()
                         }
                         true
                     }
@@ -376,24 +333,21 @@ fun ModelViewer(
             }
 
             uiHelper.renderCallback = object : UiHelper.RendererCallback {
-
                 override fun onNativeWindowChanged(surface: Surface) {
                     swapChain?.let { engine.destroySwapChain(it) }
                     swapChain = engine.createSwapChain(surface)
                     displayHelper.attach(renderer, surfaceView.display)
-
                     state.updateCamera()
 
                     val frameCallback = object : Choreographer.FrameCallback {
                         override fun doFrame(frameTimeNanos: Long) {
-
                             if (surfaceView.height > 0) {
                                 val aspect = surfaceView.width.toDouble() / surfaceView.height
                                 camera.setProjection(45.0, aspect, 0.1, 500.0, Camera.Fov.VERTICAL)
                             }
 
-                            swapChain?.let { sc ->
-                                if (renderer.beginFrame(sc, frameTimeNanos)) {
+                            swapChain?.let { chain ->
+                                if (renderer.beginFrame(chain, frameTimeNanos)) {
                                     renderer.render(view)
                                     renderer.endFrame()
                                 }
@@ -423,3 +377,5 @@ fun ModelViewer(
         modifier = modifier
     )
 }
+
+
