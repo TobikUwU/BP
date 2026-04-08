@@ -6,7 +6,6 @@ import com.example.bp.ModelDownloader
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.io.File
 
 class DownloadManager(private val context: Context) {
 
@@ -37,7 +36,7 @@ class DownloadManager(private val context: Context) {
     sealed class DownloadState {
         data class Preparing(val modelName: String) : DownloadState()
         data class Downloading(val modelName: String, val progress: DownloadProgress) : DownloadState()
-        data class Completed(val modelName: String, val file: File) : DownloadState()
+        data class Completed(val modelName: String, val session: StreamSession) : DownloadState()
         data class Failed(val modelName: String, val error: String) : DownloadState()
         data class Paused(val modelName: String, val progress: DownloadProgress) : DownloadState()
     }
@@ -49,29 +48,31 @@ class DownloadManager(private val context: Context) {
     suspend fun downloadModelSmart(
         modelInfo: ModelInfo,
         onProgress: ((DownloadProgress) -> Unit)? = null
-    ): File? {
-        _currentDownload.value = DownloadState.Preparing(modelInfo.id)
+    ): StreamSession? {
+        _currentDownload.value = DownloadState.Preparing(modelInfo.name)
         return try {
-            val file = modelDownloader.downloadModel(modelInfo) { progress ->
-                _currentDownload.value = DownloadState.Downloading(modelInfo.id, progress)
+            val session = modelDownloader.prepareStreamSession(modelInfo) { progress ->
+                _currentDownload.value = DownloadState.Downloading(modelInfo.name, progress)
                 onProgress?.invoke(progress)
             }
 
-            if (file != null) {
-                _currentDownload.value = DownloadState.Completed(modelInfo.id, file)
+            if (session != null) {
+                _currentDownload.value = DownloadState.Completed(modelInfo.name, session)
             } else {
-                _currentDownload.value = DownloadState.Failed(modelInfo.id, "Download failed")
+                _currentDownload.value = DownloadState.Failed(modelInfo.name, "Download failed")
             }
-            file
+            session
         } catch (e: Exception) {
             Log.e(TAG, "Download error", e)
-            _currentDownload.value = DownloadState.Failed(modelInfo.id, e.message ?: "Unknown error")
+            _currentDownload.value = DownloadState.Failed(modelInfo.name, e.message ?: "Unknown error")
             null
         }
     }
 
+    fun getCachedSession(modelInfo: ModelInfo): StreamSession? = modelDownloader.getCachedSession(modelInfo)
+
     fun queueDownload(modelInfo: ModelInfo, priority: Priority = Priority.NORMAL) {
-        _downloadQueue.value = (_downloadQueue.value + QueuedDownload(modelInfo.id, modelInfo, priority))
+        _downloadQueue.value = (_downloadQueue.value + QueuedDownload(modelInfo.name, modelInfo, priority))
             .sortedByDescending { it.priority.ordinal }
     }
 
@@ -95,10 +96,11 @@ class DownloadManager(private val context: Context) {
         val estimatedTime = estimateDownloadTime(modelInfo, networkStats)
 
         return buildString {
-            append("📡 Připojení: ${networkStats.connectionType.name}\n")
-            if (networkStats.isMetered) append("⚠️ Mobilní data aktivní\n")
-            append("📦 Režim: Balík manifestu + LOD assety\n")
-            if (estimatedTime > 0) append("⏱️ Odhad: ${formatTime(estimatedTime)}\n")
+            append("Připojení: ${networkStats.connectionType.name}\n")
+            if (networkStats.isMetered) append("Mobilní data aktivní\n")
+            append("Backend: ${modelInfo.streamingStrategy.ifBlank { "hybrid_overview_tiles" }}\n")
+            append("Overview stages: ${modelInfo.overviewStageCount}, detail tiles: ${modelInfo.tileCount}\n")
+            if (estimatedTime > 0) append("Odhad prvního stage: ${formatTime(estimatedTime)}\n")
         }
     }
 
@@ -117,10 +119,10 @@ class DownloadManager(private val context: Context) {
     }
 
     suspend fun getAvailableModels(): List<ModelInfo> = modelDownloader.getAvailableModels()
-    fun isModelDownloaded(modelId: String): Boolean = modelDownloader.isModelDownloaded(modelId)
-    fun getModelPath(modelId: String): String? = modelDownloader.getModelPath(modelId)
-    fun getModelSize(modelId: String): Long = modelDownloader.getModelSize(modelId)
-    fun deleteModel(modelId: String): Boolean = modelDownloader.deleteModel(modelId)
+    fun isModelDownloaded(modelName: String): Boolean = modelDownloader.isModelDownloaded(modelName)
+    fun getModelPath(modelName: String): String? = modelDownloader.getModelPath(modelName)
+    fun getModelSize(modelName: String): Long = modelDownloader.getModelSize(modelName)
+    fun deleteModel(modelName: String): Boolean = modelDownloader.deleteModel(modelName)
     fun clearCache() = modelDownloader.clearCache()
     fun getCacheSize(): Long = modelDownloader.getCacheSize()
 
@@ -130,7 +132,7 @@ class DownloadManager(private val context: Context) {
     }
 
     suspend fun pauseDownload(modelName: String): Boolean = false
-    suspend fun resumeDownload(modelName: String, onProgress: ((DownloadProgress) -> Unit)? = null): File? = null
+    suspend fun resumeDownload(modelName: String, onProgress: ((DownloadProgress) -> Unit)? = null): StreamSession? = null
     suspend fun cancelDownload(modelName: String): Boolean = false
     fun getPausedDownloads(): List<DownloadStateManager.DownloadStateData> = emptyList()
     suspend fun autoResumeDownloads(): Int = 0

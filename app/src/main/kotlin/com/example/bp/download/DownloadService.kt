@@ -11,9 +11,13 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.bp.MainActivity
-import com.example.bp.R
-import kotlinx.coroutines.*
-
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 class DownloadService : Service() {
 
@@ -87,30 +91,10 @@ class DownloadService : Service() {
         Log.d(TAG, "onStartCommand: ${intent?.action}")
 
         when (intent?.action) {
-            ACTION_START_DOWNLOAD -> {
-                val modelName = intent.getStringExtra(EXTRA_MODEL_NAME)
-                if (modelName != null) {
-                    startDownloadInternal(modelName)
-                }
-            }
-            ACTION_PAUSE_DOWNLOAD -> {
-                val modelName = intent.getStringExtra(EXTRA_MODEL_NAME)
-                if (modelName != null) {
-                    pauseDownloadInternal(modelName)
-                }
-            }
-            ACTION_RESUME_DOWNLOAD -> {
-                val modelName = intent.getStringExtra(EXTRA_MODEL_NAME)
-                if (modelName != null) {
-                    resumeDownloadInternal(modelName)
-                }
-            }
-            ACTION_CANCEL_DOWNLOAD -> {
-                val modelName = intent.getStringExtra(EXTRA_MODEL_NAME)
-                if (modelName != null) {
-                    cancelDownloadInternal(modelName)
-                }
-            }
+            ACTION_START_DOWNLOAD -> intent.getStringExtra(EXTRA_MODEL_NAME)?.let(::startDownloadInternal)
+            ACTION_PAUSE_DOWNLOAD -> intent.getStringExtra(EXTRA_MODEL_NAME)?.let(::pauseDownloadInternal)
+            ACTION_RESUME_DOWNLOAD -> intent.getStringExtra(EXTRA_MODEL_NAME)?.let(::resumeDownloadInternal)
+            ACTION_CANCEL_DOWNLOAD -> intent.getStringExtra(EXTRA_MODEL_NAME)?.let(::cancelDownloadInternal)
         }
 
         return START_STICKY
@@ -118,37 +102,52 @@ class DownloadService : Service() {
 
     private fun startDownloadInternal(modelName: String) {
         currentModelName = modelName
+        currentDownloadJob?.cancel()
 
-        startForeground(NOTIFICATION_ID, createNotification(
-            modelName = modelName,
-            progress = 0,
-            isPaused = false
-        ))
+        startForeground(
+            NOTIFICATION_ID,
+            createNotification(
+                modelName = modelName,
+                progress = 0,
+                isPaused = false
+            )
+        )
 
         currentDownloadJob = serviceScope.launch {
             try {
                 val downloadManager = DownloadManager(applicationContext)
-                val modelInfo = ModelInfo(id = modelName, name = modelName, createdAt = "", lodCount = 0, totalSizeInMB = 0.0)
+                val modelInfo = downloadManager
+                    .getAvailableModels()
+                    .firstOrNull { it.name == modelName }
+                    ?: ModelInfo(name = modelName, id = modelName)
 
-                downloadManager.downloadModelSmart(modelInfo) { progress ->
+                val session = downloadManager.downloadModelSmart(modelInfo) { progress ->
+                    val progressPercent = if (progress.totalBytes > 0) {
+                        (progress.downloadedBytes * 100 / progress.totalBytes).toInt()
+                    } else {
+                        0
+                    }
                     updateNotification(
                         modelName = modelName,
-                        progress = (progress.downloadedBytes * 100 / progress.totalBytes).toInt(),
+                        progress = progressPercent,
                         isPaused = false,
                         speed = progress.currentSpeed,
                         eta = progress.eta
                     )
                 }
 
-                showCompletedNotification(modelName)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (session != null) {
+                    showCompletedNotification(modelName)
+                } else {
+                    showErrorNotification(modelName, "Načtení stream bootstrapu nebo entry stage selhalo")
+                }
             } catch (e: CancellationException) {
                 Log.d(TAG, "Download cancelled: $modelName")
                 showPausedNotification(modelName)
             } catch (e: Exception) {
                 Log.e(TAG, "Download failed: $modelName", e)
                 showErrorNotification(modelName, e.message ?: "Neznámá chyba")
+            } finally {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
@@ -156,72 +155,19 @@ class DownloadService : Service() {
     }
 
     private fun pauseDownloadInternal(modelName: String) {
-        serviceScope.launch {
-            try {
-                val downloadManager = DownloadManager(applicationContext)
-                val parallelDownloader = ParallelModelDownloader(applicationContext)
-                parallelDownloader.pauseDownload(modelName)
-
-                showPausedNotification(modelName)
-                stopForeground(STOP_FOREGROUND_DETACH)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to pause download", e)
-            }
-        }
+        currentDownloadJob?.cancel()
+        showPausedNotification(modelName)
+        stopForeground(STOP_FOREGROUND_DETACH)
     }
 
     private fun resumeDownloadInternal(modelName: String) {
-        currentModelName = modelName
-
-        startForeground(NOTIFICATION_ID, createNotification(
-            modelName = modelName,
-            progress = 0,
-            isPaused = false,
-            isResuming = true
-        ))
-
-        currentDownloadJob = serviceScope.launch {
-            try {
-                val parallelDownloader = ParallelModelDownloader(applicationContext)
-
-                parallelDownloader.resumeDownload(modelName) { progress ->
-                    updateNotification(
-                        modelName = modelName,
-                        progress = (progress.downloadedBytes * 100 / progress.totalBytes).toInt(),
-                        isPaused = false,
-                        speed = progress.currentSpeed,
-                        eta = progress.eta
-                    )
-                }
-
-                showCompletedNotification(modelName)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            } catch (e: CancellationException) {
-                Log.d(TAG, "Download paused again: $modelName")
-                showPausedNotification(modelName)
-            } catch (e: Exception) {
-                Log.e(TAG, "Resume failed: $modelName", e)
-                showErrorNotification(modelName, e.message ?: "Neznámá chyba")
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
-        }
+        startDownloadInternal(modelName)
     }
 
     private fun cancelDownloadInternal(modelName: String) {
-        serviceScope.launch {
-            try {
-                currentDownloadJob?.cancel()
-                val parallelDownloader = ParallelModelDownloader(applicationContext)
-                parallelDownloader.cancelDownload(modelName)
-
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to cancel download", e)
-            }
-        }
+        currentDownloadJob?.cancel()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun createNotificationChannel() {
@@ -231,7 +177,7 @@ class DownloadService : Service() {
                 "Stahování modelů",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Zobrazuje průběh stahování 3D modelů"
+                description = "Zobrazuje průběh načítání 3D modelů"
                 setShowBadge(false)
             }
             notificationManager.createNotificationChannel(channel)
@@ -253,9 +199,9 @@ class DownloadService : Service() {
         )
 
         val title = when {
-            isResuming -> "Obnovování stahování..."
-            isPaused -> "Stahování pozastaveno"
-            else -> "Stahování modelu"
+            isResuming -> "Obnovování načítání..."
+            isPaused -> "Načítání pozastaveno"
+            else -> "Načítání modelu"
         }
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -336,7 +282,7 @@ class DownloadService : Service() {
 
     private fun showCompletedNotification(modelName: String) {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Stahování dokončeno")
+            .setContentTitle("Načítání dokončeno")
             .setContentText(modelName)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -353,7 +299,7 @@ class DownloadService : Service() {
 
     private fun showErrorNotification(modelName: String, error: String) {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Chyba stahování")
+            .setContentTitle("Chyba načítání")
             .setContentText("$modelName: $error")
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -372,4 +318,3 @@ class DownloadService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 }
-

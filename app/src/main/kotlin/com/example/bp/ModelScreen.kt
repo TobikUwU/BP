@@ -18,11 +18,11 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import com.example.bp.download.DownloadManager
 import com.example.bp.download.DownloadProgress
 import com.example.bp.download.ModelInfo
+import com.example.bp.download.StreamSession
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -59,7 +60,7 @@ fun ModelScreen() {
 
     var availableModels by remember { mutableStateOf<List<ModelInfo>>(emptyList()) }
     var selectedModel by remember { mutableStateOf<ModelInfo?>(null) }
-    var downloadedModelPath by remember { mutableStateOf<String?>(null) }
+    var activeSession by remember { mutableStateOf<StreamSession?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     var isViewerLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -126,7 +127,7 @@ fun ModelScreen() {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("3D Model Viewer", style = MaterialTheme.typography.headlineSmall)
                         Text(
-                            "Manifest + glTF LOD package klient",
+                            "Hybrid overview + detail tiles klient",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -148,7 +149,9 @@ fun ModelScreen() {
                         onValueChange = {},
                         readOnly = true,
                         trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                        modifier = Modifier.fillMaxWidth().menuAnchor(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(),
                         label = { Text("Model ze serveru") },
                         enabled = !isLoading
                     )
@@ -165,18 +168,19 @@ fun ModelScreen() {
                                         Column(modifier = Modifier.weight(1f)) {
                                             Text(model.name)
                                             Text(
-                                                "${model.lodCount} LOD • ${model.totalSizeInMB} MB",
+                                                "${model.overviewStageCount} overview • ${model.tileCount} tiles • ${model.sizeInMB} MB",
                                                 style = MaterialTheme.typography.bodySmall
                                             )
                                         }
 
-                                        if (downloadManager.isModelDownloaded(model.id)) {
+                                        if (downloadManager.isModelDownloaded(model.name)) {
                                             IconButton(onClick = {
-                                                if (downloadManager.deleteModel(model.id)) {
-                                                    if (selectedModel?.id == model.id) {
-                                                        downloadedModelPath = null
+                                                if (downloadManager.deleteModel(model.name)) {
+                                                    if (activeSession?.model?.name == model.name) {
+                                                        activeSession = null
                                                     }
                                                     Toast.makeText(context, "Model ${model.name} smazán", Toast.LENGTH_SHORT).show()
+                                                    cacheSize = downloadManager.getCacheSize()
                                                 }
                                             }) {
                                                 Icon(
@@ -203,7 +207,7 @@ fun ModelScreen() {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(
-                            containerColor = if (downloadManager.isModelDownloaded(model.id)) {
+                            containerColor = if (downloadManager.isModelDownloaded(model.name)) {
                                 MaterialTheme.colorScheme.primaryContainer
                             } else {
                                 MaterialTheme.colorScheme.secondaryContainer
@@ -212,8 +216,13 @@ fun ModelScreen() {
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Text(model.name, fontWeight = FontWeight.Bold)
-                            Text("ID: ${model.id}", style = MaterialTheme.typography.bodySmall)
-                            Text("${model.lodCount} LOD • ${model.totalSizeInMB} MB", style = MaterialTheme.typography.bodySmall)
+                            Text("Strategy: ${model.streamingStrategy.ifBlank { "hybrid_overview_tiles" }}", style = MaterialTheme.typography.bodySmall)
+                            Text("Entry: ${model.entryFile}", style = MaterialTheme.typography.bodySmall)
+                            Text("Overview stages: ${model.overviewStageCount}", style = MaterialTheme.typography.bodySmall)
+                            Text("Detail tiles: ${model.tileCount}", style = MaterialTheme.typography.bodySmall)
+                            if (model.upgradeOrder.isNotEmpty()) {
+                                Text("Upgrade order: ${model.upgradeOrder.joinToString(" → ")}", style = MaterialTheme.typography.bodySmall)
+                            }
                             Text(downloadManager.getDownloadRecommendation(model), style = MaterialTheme.typography.bodySmall)
                         }
                     }
@@ -228,22 +237,23 @@ fun ModelScreen() {
                             downloadJob = scope.launch {
                                 try {
                                     errorMessage = null
-                                    if (downloadManager.isModelDownloaded(model.id)) {
-                                        downloadedModelPath = downloadManager.getModelPath(model.id)
+                                    val cached = downloadManager.getCachedSession(model)
+                                    if (cached != null) {
+                                        activeSession = cached
                                         return@launch
                                     }
 
                                     isLoading = true
                                     downloadProgress = null
-                                    val file = downloadManager.downloadModelSmart(model) { progress ->
+                                    val session = downloadManager.downloadModelSmart(model) { progress ->
                                         downloadProgress = progress
                                     }
 
-                                    if (file != null) {
-                                        downloadedModelPath = file.absolutePath
+                                    if (session != null) {
+                                        activeSession = session
                                         cacheSize = downloadManager.getCacheSize()
                                     } else {
-                                        errorMessage = "Stahování selhalo"
+                                        errorMessage = "Načtení stream bootstrapu selhalo"
                                     }
                                 } catch (e: Exception) {
                                     Log.e("ModelScreen", "Download error", e)
@@ -263,10 +273,10 @@ fun ModelScreen() {
                         Spacer(modifier = Modifier.height(8.dp))
                     }
                     Text(
-                        if (selectedModel?.id?.let(downloadManager::isModelDownloaded) == true) {
-                            "Zobrazit model"
+                        if (selectedModel?.name?.let(downloadManager::isModelDownloaded) == true) {
+                            "Zobrazit stream model"
                         } else {
-                            "Stáhnout balík modelu"
+                            "Načíst entry stage"
                         }
                     )
                 }
@@ -282,7 +292,7 @@ fun ModelScreen() {
                                 progress.downloadedBytes.toFloat() / progress.totalBytes.toFloat()
                             } else 0f
                             Text(
-                                "Stahování balíku ${((progressValue) * 100).roundToInt()}%",
+                                "Načítání první overview stage ${((progressValue) * 100).roundToInt()}%",
                                 fontWeight = FontWeight.Bold
                             )
                             Spacer(modifier = Modifier.height(8.dp))
@@ -316,17 +326,19 @@ fun ModelScreen() {
 
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             when {
-                downloadedModelPath != null -> {
+                activeSession != null -> {
                     Box(modifier = Modifier.fillMaxSize()) {
                         ModelViewer(
                             modifier = Modifier.fillMaxSize(),
-                            modelPath = downloadedModelPath!!,
+                            session = activeSession!!,
                             onModelLoaded = { isViewerLoading = false }
                         )
 
                         if (isViewerLoading) {
                             Surface(
-                                modifier = Modifier.align(Alignment.TopCenter).padding(16.dp),
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(16.dp),
                                 color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.95f),
                                 shape = MaterialTheme.shapes.medium
                             ) {
@@ -336,13 +348,19 @@ fun ModelScreen() {
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     CircularProgressIndicator()
-                                    Text("Načítání glTF balíku do vieweru...")
+                                    Column {
+                                        Text("Načítání první overview stage...")
+                                        Text(
+                                            "Po prvním zobrazení klient postupně přepíná overview LODy a stahuje detail tiles podle hierarchie manifestu.",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
 
-                    LaunchedEffect(downloadedModelPath) {
+                    LaunchedEffect(activeSession?.entryFilePath) {
                         isViewerLoading = true
                     }
                 }
@@ -350,7 +368,7 @@ fun ModelScreen() {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         CircularProgressIndicator()
                         Spacer(modifier = Modifier.height(12.dp))
-                        Text("Stahování modelového balíku...")
+                        Text("Načítání stream bootstrapu...")
                     }
                 }
                 else -> {
@@ -369,6 +387,3 @@ fun ModelScreen() {
         }
     }
 }
-
-
-

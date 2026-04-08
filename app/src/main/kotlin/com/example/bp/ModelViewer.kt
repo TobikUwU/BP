@@ -1,7 +1,6 @@
 package com.example.bp
 
 import android.annotation.SuppressLint
-import android.content.Context
 import android.util.Log
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -11,12 +10,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.bp.download.StreamSession
+import com.example.bp.download.StreamStage
+import com.example.bp.download.StreamTile
 import com.google.android.filament.Camera
 import com.google.android.filament.Engine
 import com.google.android.filament.EntityManager
@@ -35,9 +38,7 @@ import com.google.android.filament.gltfio.ResourceLoader
 import com.google.android.filament.gltfio.UbershaderProvider
 import com.google.android.filament.utils.KTX1Loader
 import com.google.android.filament.utils.Utils
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
@@ -47,7 +48,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-private fun loadAssetAsByteBuffer(context: Context, assetName: String): ByteBuffer {
+private fun loadAssetAsByteBuffer(context: android.content.Context, assetName: String): ByteBuffer {
     context.assets.open(assetName).use { input ->
         return ByteBuffer.wrap(input.readBytes())
     }
@@ -61,32 +62,6 @@ private fun loadFileAsByteBuffer(file: File): ByteBuffer {
         .apply { flip() }
 }
 
-private fun addResourceData(resourceLoader: ResourceLoader, uri: String, buffer: ByteBuffer): Boolean {
-    val method = resourceLoader.javaClass.methods.firstOrNull {
-        it.name == "addResourceData" && it.parameterCount == 2
-    } ?: return false
-
-    method.invoke(resourceLoader, uri, buffer)
-    return true
-}
-
-private fun provideExternalResources(resourceLoader: ResourceLoader, asset: FilamentAsset, modelFile: File) {
-    val baseDir = modelFile.parentFile ?: return
-    asset.resourceUris.forEach { uri ->
-        val resourceFile = File(baseDir, uri)
-        if (!resourceFile.exists()) {
-            Log.w("ModelViewer", "Missing external resource: ${resourceFile.absolutePath}")
-            return@forEach
-        }
-
-        val buffer = loadFileAsByteBuffer(resourceFile)
-        val added = addResourceData(resourceLoader, uri, buffer)
-        if (!added) {
-            Log.w("ModelViewer", "ResourceLoader.addResourceData not available for $uri")
-        }
-    }
-}
-
 private class FilamentState(
     val engine: Engine,
     val renderer: Renderer,
@@ -96,13 +71,11 @@ private class FilamentState(
     val assetLoader: AssetLoader,
     val resourceLoader: ResourceLoader
 ) {
-    var currentAsset: FilamentAsset? = null
+    private var overviewAsset: FilamentAsset? = null
+    private val tileAssets = linkedMapOf<String, FilamentAsset>()
+    private val resolvedTileIds = linkedSetOf<String>()
+
     val modelCenter = FloatArray(3)
-
-    var isLoadingAsset = false
-    var queuedModelPath: String? = null
-    var onQueuedPathReady: ((String) -> Unit)? = null
-
     var cameraDistance = 6.0
     var cameraAngleX = 0.0
     var cameraAngleY = 20.0
@@ -116,27 +89,85 @@ private class FilamentState(
         val eyeZ = modelCenter[2] + cameraDistance * cos(angleYRad) * cos(angleXRad)
 
         camera.lookAt(
-            eyeX, eyeY, eyeZ,
-            modelCenter[0].toDouble(), modelCenter[1].toDouble(), modelCenter[2].toDouble(),
-            0.0, 1.0, 0.0
+            eyeX,
+            eyeY,
+            eyeZ,
+            modelCenter[0].toDouble(),
+            modelCenter[1].toDouble(),
+            modelCenter[2].toDouble(),
+            0.0,
+            1.0,
+            0.0
         )
     }
 
-    fun swapModel(newAsset: FilamentAsset) {
-        currentAsset?.let { scene.removeEntities(it.entities) }
-        scene.addEntities(newAsset.entities)
-
-        val center = newAsset.boundingBox.center
+    private fun updateBoundsFromAsset(asset: FilamentAsset) {
+        val center = asset.boundingBox.center
         modelCenter[0] = center[0]
         modelCenter[1] = center[1]
         modelCenter[2] = center[2]
 
-        val halfExtent = newAsset.boundingBox.halfExtent
+        val halfExtent = asset.boundingBox.halfExtent
         val maxExtent = maxOf(halfExtent[0], halfExtent[1], halfExtent[2])
         cameraDistance = (maxExtent * 3.5).coerceAtLeast(6.0)
         updateCamera()
+    }
 
-        currentAsset = newAsset
+    fun setOverviewAsset(newAsset: FilamentAsset) {
+        overviewAsset?.let { previous ->
+            scene.removeEntities(previous.entities)
+            assetLoader.destroyAsset(previous)
+        }
+
+        scene.addEntities(newAsset.entities)
+        updateBoundsFromAsset(newAsset)
+        overviewAsset = newAsset
+    }
+
+    fun hideOverview() {
+        overviewAsset?.let { asset ->
+            scene.removeEntities(asset.entities)
+            assetLoader.destroyAsset(asset)
+        }
+        overviewAsset = null
+    }
+
+    fun registerTile(tileId: String, asset: FilamentAsset, updateViewBounds: Boolean = false) {
+        removeTile(tileId)
+        scene.addEntities(asset.entities)
+        tileAssets[tileId] = asset
+        resolvedTileIds.add(tileId)
+        if (updateViewBounds) {
+            updateBoundsFromAsset(asset)
+        }
+    }
+
+    fun removeTile(tileId: String) {
+        val asset = tileAssets.remove(tileId) ?: return
+        scene.removeEntities(asset.entities)
+        assetLoader.destroyAsset(asset)
+    }
+
+    fun isTileResolved(tileId: String): Boolean {
+        return tileId in resolvedTileIds
+    }
+
+    fun isTileVisible(tileId: String): Boolean {
+        return tileId in tileAssets
+    }
+
+    fun markTileResolved(tileId: String) {
+        resolvedTileIds.add(tileId)
+    }
+
+    fun areTilesResolved(tileIds: Collection<String>): Boolean {
+        return tileIds.isNotEmpty() && tileIds.all(::isTileResolved)
+    }
+
+    fun clearSceneAssets() {
+        hideOverview()
+        tileAssets.keys.toList().forEach(::removeTile)
+        resolvedTileIds.clear()
     }
 }
 
@@ -144,93 +175,252 @@ private class FilamentState(
 @Composable
 fun ModelViewer(
     modifier: Modifier = Modifier,
-    modelPath: String,
+    session: StreamSession,
     onModelLoaded: (() -> Unit)? = null
 ) {
-    val scope = rememberCoroutineScope()
-
-    var loadedPath by remember { mutableStateOf<String?>(null) }
-    var isLoading by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val downloader = remember(context) { ModelDownloader(context) }
     var filamentState by remember { mutableStateOf<FilamentState?>(null) }
+    var loadToken by remember { mutableIntStateOf(0) }
 
-    fun loadModel(pathToLoad: String, state: FilamentState) {
-        scope.launch {
-            try {
-                val modelFile = File(pathToLoad)
-                val buffer = withContext(Dispatchers.IO) {
-                    if (!modelFile.exists()) {
-                        throw IllegalArgumentException("Model soubor neexistuje: $pathToLoad")
+    fun overviewSequence(currentSession: StreamSession): List<StreamStage> {
+        val stages = currentSession.bootstrap.manifest.overviewStages
+        if (stages.isEmpty()) return emptyList()
+
+        val stageMap = stages.associateBy { it.id }
+        val ordered = buildList {
+            currentSession.bootstrap.manifest.upgradeOrder.forEach { stageId ->
+                stageMap[stageId]?.let(::add)
+            }
+            stages.forEach { stage ->
+                if (none { it.id == stage.id }) add(stage)
+            }
+        }
+
+        return ordered
+    }
+
+    fun tilePriorityMap(currentSession: StreamSession): Map<String, Int> {
+        return currentSession.bootstrap.manifest.tileTraversalOrder.withIndex()
+            .associate { it.value to it.index }
+    }
+
+    fun rootTileSequence(currentSession: StreamSession): List<StreamTile> {
+        val manifest = currentSession.bootstrap.manifest
+        if (manifest.tiles.isEmpty()) return emptyList()
+
+        val tileMap = manifest.tiles.associateBy { it.id }
+        val priorityMap = tilePriorityMap(currentSession)
+        val orderedIds = buildList {
+            manifest.rootTiles.forEach { tileId ->
+                if (!contains(tileId)) add(tileId)
+            }
+            manifest.tiles.filter { it.parentId == null }.forEach { tile ->
+                if (!contains(tile.id)) add(tile.id)
+            }
+        }
+
+        return orderedIds
+            .mapNotNull(tileMap::get)
+            .sortedBy { priorityMap[it.id] ?: Int.MAX_VALUE }
+    }
+
+    fun refinementTileSequence(currentSession: StreamSession): List<StreamTile> {
+        val manifest = currentSession.bootstrap.manifest
+        if (manifest.tiles.isEmpty()) return emptyList()
+
+        val tileMap = manifest.tiles.associateBy { it.id }
+        val priorityMap = tilePriorityMap(currentSession)
+        val rootIds = rootTileSequence(currentSession).map { it.id }.toSet()
+        val ordered = mutableListOf<StreamTile>()
+        val visited = mutableSetOf<String>()
+
+        fun visitChildren(tile: StreamTile) {
+            tile.children
+                .mapNotNull(tileMap::get)
+                .sortedBy { priorityMap[it.id] ?: Int.MAX_VALUE }
+                .forEach { child ->
+                    if (visited.add(child.id)) {
+                        ordered += child
                     }
-                    loadFileAsByteBuffer(modelFile)
+                    visitChildren(child)
                 }
+        }
 
-                val asset = state.assetLoader.createAsset(buffer)
-                if (asset == null) {
-                    isLoading = false
-                    state.isLoadingAsset = false
-                    Log.e("ModelViewer", "Failed to create asset from $pathToLoad")
-                    return@launch
+        rootTileSequence(currentSession).forEach(::visitChildren)
+
+        currentSession.bootstrap.manifest.tileTraversalOrder
+            .mapNotNull(tileMap::get)
+            .forEach { tile ->
+                if (tile.id !in rootIds && visited.add(tile.id)) {
+                    ordered += tile
+                    visitChildren(tile)
                 }
+            }
 
-                withContext(Dispatchers.IO) {
-                    if (asset.resourceUris.isNotEmpty()) {
-                        provideExternalResources(state.resourceLoader, asset, modelFile)
-                    }
-                    state.resourceLoader.loadResources(asset)
-                    asset.releaseSourceData()
+        currentSession.bootstrap.manifest.tiles.forEach { tile ->
+            if (tile.id !in rootIds && visited.add(tile.id)) {
+                ordered += tile
+                visitChildren(tile)
+            }
+        }
+
+        return ordered
+    }
+
+    suspend fun createAsset(state: FilamentState, file: File, label: String): FilamentAsset? {
+        val buffer = withContext(Dispatchers.IO) { loadFileAsByteBuffer(file) }
+        val asset = state.assetLoader.createAsset(buffer)
+        if (asset == null) {
+            Log.e("ModelViewer", "Failed to create GLB asset for $label")
+            return null
+        }
+
+        state.resourceLoader.loadResources(asset)
+        asset.releaseSourceData()
+        return asset
+    }
+
+    suspend fun loadStage(state: FilamentState, stage: StreamStage, token: Int) {
+        val sequence = overviewSequence(session)
+        val stageIndex = sequence.indexOfFirst { it.id == stage.id }.coerceAtLeast(0) + 1
+        val stageFile = downloader.ensureOverviewStageCached(
+            session = session,
+            stage = stage,
+            stageIndex = stageIndex,
+            stageCount = sequence.size,
+        ) ?: return
+
+        if (token != loadToken) return
+
+        val asset = createAsset(state, stageFile, stage.id) ?: return
+        if (token != loadToken) {
+            state.assetLoader.destroyAsset(asset)
+            return
+        }
+
+        state.setOverviewAsset(asset)
+    }
+
+    fun promoteResolvedTiles(
+        state: FilamentState,
+        tileMap: Map<String, StreamTile>,
+        loadedTileId: String
+    ) {
+        var parentId = tileMap[loadedTileId]?.parentId
+        while (parentId != null) {
+            val parentTile = tileMap[parentId] ?: break
+            if (parentTile.children.isNotEmpty() && parentTile.children.all(state::isTileResolved)) {
+                if (state.isTileVisible(parentId)) {
+                    state.removeTile(parentId)
                 }
-
-                state.swapModel(asset)
-                loadedPath = pathToLoad
-                isLoading = false
-                state.isLoadingAsset = false
-                onModelLoaded?.invoke()
-
-                val nextPath = state.queuedModelPath
-                if (nextPath != null) {
-                    state.queuedModelPath = null
-                    val callback = state.onQueuedPathReady
-                    state.onQueuedPathReady = null
-                    callback?.invoke(nextPath)
-                }
-            } catch (e: CancellationException) {
-                isLoading = false
-                state.isLoadingAsset = false
-                throw e
-            } catch (e: Exception) {
-                Log.e("ModelViewer", "Error loading model", e)
-                isLoading = false
-                state.isLoadingAsset = false
+                state.markTileResolved(parentId)
+                parentId = parentTile.parentId
+            } else {
+                break
             }
         }
     }
 
-    LaunchedEffect(modelPath, filamentState) {
-        val state = filamentState ?: return@LaunchedEffect
-        if (modelPath == loadedPath) return@LaunchedEffect
+    suspend fun loadTile(
+        state: FilamentState,
+        tile: StreamTile,
+        tileIndex: Int,
+        tileCount: Int,
+        token: Int,
+        updateViewBounds: Boolean,
+    ) {
+        val tileFile = downloader.ensureTileCached(
+            session = session,
+            tile = tile,
+            tileIndex = tileIndex,
+            tileCount = tileCount,
+        ) ?: return
 
-        if (isLoading || state.isLoadingAsset) {
-            state.queuedModelPath = modelPath
-            state.onQueuedPathReady = { queuedPath ->
-                if (queuedPath != loadedPath) {
-                    isLoading = true
-                    loadModel(queuedPath, state)
-                }
-            }
-            return@LaunchedEffect
+        if (token != loadToken) return
+
+        val asset = createAsset(state, tileFile, tile.id) ?: return
+        if (token != loadToken) {
+            state.assetLoader.destroyAsset(asset)
+            return
         }
 
-        isLoading = true
-        state.isLoadingAsset = true
-        loadModel(modelPath, state)
+        state.registerTile(tile.id, asset, updateViewBounds)
+    }
+
+    LaunchedEffect(session, filamentState) {
+        val state = filamentState ?: return@LaunchedEffect
+        val overviewStages = overviewSequence(session)
+        val rootTiles = rootTileSequence(session)
+        val refinementTiles = refinementTileSequence(session)
+        val tileMap = session.bootstrap.manifest.tiles.associateBy { it.id }
+
+        loadToken += 1
+        val token = loadToken
+        var firstVisualDelivered = false
+
+        state.clearSceneAssets()
+
+        overviewStages.forEach { stage ->
+            loadStage(state, stage, token)
+            if (token != loadToken) return@LaunchedEffect
+            if (!firstVisualDelivered) {
+                onModelLoaded?.invoke()
+                firstVisualDelivered = true
+            }
+        }
+
+        rootTiles.forEachIndexed { index, tile ->
+            loadTile(
+                state = state,
+                tile = tile,
+                tileIndex = index + 1,
+                tileCount = rootTiles.size,
+                token = token,
+                updateViewBounds = overviewStages.isEmpty() && index == 0,
+            )
+            if (token != loadToken) return@LaunchedEffect
+            if (!firstVisualDelivered && state.isTileVisible(tile.id)) {
+                onModelLoaded?.invoke()
+                firstVisualDelivered = true
+            }
+        }
+
+        if (state.areTilesResolved(rootTiles.map { it.id })) {
+            state.hideOverview()
+        }
+
+        refinementTiles.forEachIndexed { index, tile ->
+            loadTile(
+                state = state,
+                tile = tile,
+                tileIndex = index + 1,
+                tileCount = refinementTiles.size,
+                token = token,
+                updateViewBounds = false,
+            )
+            if (token != loadToken) return@LaunchedEffect
+            if (!state.isTileVisible(tile.id)) {
+                return@forEachIndexed
+            }
+
+            promoteResolvedTiles(state, tileMap, tile.id)
+            if (state.areTilesResolved(rootTiles.map { it.id })) {
+                state.hideOverview()
+            }
+        }
     }
 
     DisposableEffect(Unit) {
-        onDispose { Log.d("ModelViewer", "ModelViewer disposed") }
+        onDispose {
+            filamentState?.clearSceneAssets()
+            Log.d("ModelViewer", "ModelViewer disposed")
+        }
     }
 
     AndroidView(
-        factory = { ctx ->            Gltfio.init()
+        factory = { ctx ->
+            Gltfio.init()
             Utils.init()
 
             val engine = Engine.create()
@@ -258,7 +448,6 @@ fun ModelViewer(
             val materialProvider = UbershaderProvider(engine)
             val assetLoader = AssetLoader(engine, materialProvider, EntityManager.get())
             val resourceLoader = ResourceLoader(engine)
-
             val state = FilamentState(engine, renderer, scene, view, camera, assetLoader, resourceLoader)
             filamentState = state
 
@@ -377,5 +566,3 @@ fun ModelViewer(
         modifier = modifier
     )
 }
-
-
