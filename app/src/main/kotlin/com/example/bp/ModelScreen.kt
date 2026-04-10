@@ -97,7 +97,6 @@ fun ModelScreen() {
         isLoading = true
         errorMessage = null
         try {
-            downloadManager.initialize()
             availableModels = downloadManager.getAvailableModels()
             cacheSize = downloadManager.getCacheSize()
             if (availableModels.isEmpty()) {
@@ -223,7 +222,6 @@ fun ModelScreen() {
                             if (model.upgradeOrder.isNotEmpty()) {
                                 Text("Upgrade order: ${model.upgradeOrder.joinToString(" → ")}", style = MaterialTheme.typography.bodySmall)
                             }
-                            Text(downloadManager.getDownloadRecommendation(model), style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 }

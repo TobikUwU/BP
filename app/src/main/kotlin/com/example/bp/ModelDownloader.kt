@@ -217,26 +217,6 @@ class ModelDownloader(private val context: Context) {
         )
     }
 
-    fun getModelPath(modelKey: String): String? {
-        val bootstrap = getLocalBootstrap(modelKey) ?: return null
-        val entryStage = resolveEntryStage(bootstrap) ?: return null
-        val entryFile = File(getModelCacheDir(bootstrap.modelName), entryStage.file)
-        if (entryFile.exists()) {
-            markModelAccessed(bootstrap.modelName)
-            return entryFile.absolutePath
-        }
-        return null
-    }
-
-    fun getModelSize(modelKey: String): Long {
-        val cacheDir = getModelCacheDir(modelKey)
-        if (!cacheDir.exists()) return 0L
-        return cacheDir.walkTopDown()
-            .filter { it.isFile }
-            .map { it.length() }
-            .sum()
-    }
-
     fun deleteModel(modelKey: String): Boolean {
         return try {
             val cacheDir = getModelCacheDir(modelKey)
@@ -245,10 +225,6 @@ class ModelDownloader(private val context: Context) {
             Log.e(TAG, "Error deleting cached model", e)
             false
         }
-    }
-
-    fun clearCache() {
-        modelsDir.listFiles()?.forEach { it.deleteRecursively() }
     }
 
     fun getCacheSize(): Long {
