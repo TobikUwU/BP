@@ -12,16 +12,11 @@ class DownloadManager(private val context: Context) {
     private val bandwidthMonitor = BandwidthMonitor(context)
     private val modelDownloader = ModelDownloader(context)
 
-    var debugForceParallel = false
-
     private val _downloadQueue = MutableStateFlow<List<QueuedDownload>>(emptyList())
     val downloadQueue: StateFlow<List<QueuedDownload>> = _downloadQueue.asStateFlow()
 
     private val _currentDownload = MutableStateFlow<DownloadState?>(null)
     val currentDownload: StateFlow<DownloadState?> = _currentDownload.asStateFlow()
-
-    private val _pausedDownloads = MutableStateFlow<List<DownloadStateManager.DownloadStateData>>(emptyList())
-    val pausedDownloads: StateFlow<List<DownloadStateManager.DownloadStateData>> = _pausedDownloads.asStateFlow()
 
     data class QueuedDownload(
         val modelName: String,
@@ -38,7 +33,6 @@ class DownloadManager(private val context: Context) {
         data class Downloading(val modelName: String, val progress: DownloadProgress) : DownloadState()
         data class Completed(val modelName: String, val session: StreamSession) : DownloadState()
         data class Failed(val modelName: String, val error: String) : DownloadState()
-        data class Paused(val modelName: String, val progress: DownloadProgress) : DownloadState()
     }
 
     companion object {
@@ -131,11 +125,5 @@ class DownloadManager(private val context: Context) {
         return bandwidthMonitor.networkStats.value
     }
 
-    suspend fun pauseDownload(modelName: String): Boolean = false
-    suspend fun resumeDownload(modelName: String, onProgress: ((DownloadProgress) -> Unit)? = null): StreamSession? = null
-    suspend fun cancelDownload(modelName: String): Boolean = false
-    fun getPausedDownloads(): List<DownloadStateManager.DownloadStateData> = emptyList()
-    suspend fun autoResumeDownloads(): Int = 0
-    fun canResumeDownload(modelName: String): Boolean = false
     fun initialize() = Unit
 }

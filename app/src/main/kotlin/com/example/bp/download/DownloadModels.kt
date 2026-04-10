@@ -37,6 +37,13 @@ data class StreamStage(
     val firstFrameCandidate: Boolean = false
 )
 
+data class StreamBounds(
+    val min: List<Double> = emptyList(),
+    val max: List<Double> = emptyList(),
+    val center: List<Double> = emptyList(),
+    val radius: Double = 0.0,
+)
+
 data class StreamTile(
     val id: String,
     val parentId: String? = null,
@@ -55,7 +62,14 @@ data class StreamTile(
     val meshNodeCount: Int = 0,
     val children: List<String> = emptyList(),
     val priority: Int = 0,
-    val screenCoverageHint: Double = 0.0
+    val screenCoverageHint: Double = 0.0,
+    val bounds: StreamBounds? = null,
+)
+
+data class StreamClientBudgets(
+    val recommendedMaxResidentOverviewStages: Int = 1,
+    val recommendedMaxActiveTiles: Int = 24,
+    val recommendedConcurrentTileRequests: Int = 2,
 )
 
 data class StreamMetadata(
@@ -87,7 +101,8 @@ data class StreamManifest(
     val tiles: List<StreamTile>,
     val tileCount: Int,
     val rootTiles: List<String>,
-    val tileTraversalOrder: List<String>
+    val tileTraversalOrder: List<String>,
+    val clientBudgets: StreamClientBudgets = StreamClientBudgets(),
 )
 
 data class StreamBootstrap(

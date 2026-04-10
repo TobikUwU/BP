@@ -6,27 +6,40 @@ import com.example.bp.download.DownloadProgress
 import com.example.bp.download.Http2ClientManager
 import com.example.bp.download.ModelInfo
 import com.example.bp.download.StreamBootstrap
+import com.example.bp.download.StreamBounds
+import com.example.bp.download.StreamClientBudgets
 import com.example.bp.download.StreamManifest
 import com.example.bp.download.StreamMetadata
 import com.example.bp.download.StreamSession
 import com.example.bp.download.StreamStage
 import com.example.bp.download.StreamTile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Callback
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class ModelDownloader(private val context: Context) {
 
     private val serverUrl = "https://192.168.50.96:3443"
     private val httpClient = Http2ClientManager.client
-    private val modelsDir = File(context.filesDir, "models")
+    private val modelsDir = File(context.cacheDir, "stream-models")
 
     companion object {
         private const val TAG = "ModelDownloader"
+        private const val DEFAULT_MAX_CACHE_BYTES = 800L * 1024L * 1024L
     }
 
     init {
@@ -42,7 +55,7 @@ class ModelDownloader(private val context: Context) {
                 .get()
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
+            executeRequest(request).use { response ->
                 if (!response.isSuccessful) {
                     Log.e(TAG, "Failed to get models: ${response.code}")
                     return@withContext emptyList()
@@ -67,6 +80,7 @@ class ModelDownloader(private val context: Context) {
     suspend fun getStreamBootstrap(modelName: String): StreamBootstrap? = withContext(Dispatchers.IO) {
         val local = getLocalBootstrap(modelName)
         if (local != null) {
+            markModelAccessed(local.modelName)
             return@withContext local
         }
 
@@ -76,7 +90,7 @@ class ModelDownloader(private val context: Context) {
                 .get()
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
+            executeRequest(request).use { response ->
                 if (!response.isSuccessful) {
                     Log.e(TAG, "Failed to get bootstrap for $modelName: ${response.code}")
                     return@withContext null
@@ -87,6 +101,7 @@ class ModelDownloader(private val context: Context) {
                 val bootstrapObject = payload.optJSONObject("bootstrap") ?: return@withContext null
                 val bootstrap = parseBootstrap(modelName, bootstrapObject)
                 cacheBootstrap(bootstrap)
+                markModelAccessed(bootstrap.modelName)
                 bootstrap
             }
         } catch (e: Exception) {
@@ -103,6 +118,7 @@ class ModelDownloader(private val context: Context) {
             val bootstrap = getStreamBootstrap(modelInfo.name) ?: return@withContext null
             val cacheDir = getModelCacheDir(modelInfo.name)
             cacheDir.mkdirs()
+            markModelAccessed(modelInfo.name)
 
             val entryStage = resolveEntryStage(bootstrap) ?: return@withContext null
             val entryFile = ensureAssetCached(
@@ -118,6 +134,7 @@ class ModelDownloader(private val context: Context) {
             ) ?: return@withContext null
 
             cacheBootstrap(bootstrap)
+            enforceCacheBudget(preserveModelName = modelInfo.name)
 
             StreamSession(
                 model = modelInfo,
@@ -190,6 +207,7 @@ class ModelDownloader(private val context: Context) {
         if (!entryFile.exists()) {
             return null
         }
+        markModelAccessed(modelInfo.name)
 
         return StreamSession(
             model = modelInfo,
@@ -203,7 +221,11 @@ class ModelDownloader(private val context: Context) {
         val bootstrap = getLocalBootstrap(modelKey) ?: return null
         val entryStage = resolveEntryStage(bootstrap) ?: return null
         val entryFile = File(getModelCacheDir(bootstrap.modelName), entryStage.file)
-        return entryFile.takeIf(File::exists)?.absolutePath
+        if (entryFile.exists()) {
+            markModelAccessed(bootstrap.modelName)
+            return entryFile.absolutePath
+        }
+        return null
     }
 
     fun getModelSize(modelKey: String): Long {
@@ -212,7 +234,7 @@ class ModelDownloader(private val context: Context) {
         return cacheDir.walkTopDown()
             .filter { it.isFile }
             .map { it.length() }
-            .sum() / (1024 * 1024)
+            .sum()
     }
 
     fun deleteModel(modelKey: String): Boolean {
@@ -298,6 +320,7 @@ class ModelDownloader(private val context: Context) {
         val manifestTiles = parseTiles(
             manifestJson.optJSONArray("tiles") ?: JSONArray(),
         )
+        val clientBudgets = parseClientBudgets(manifestJson.optJSONObject("clientBudgets"))
         val bootstrapSection = manifestJson.optJSONObject("bootstrap")
         val rootTiles = manifestJson.optJSONArray("rootTiles")?.toStringList().orEmpty()
         val tileTraversalOrder = manifestJson.optJSONArray("tileTraversalOrder")?.toStringList().orEmpty()
@@ -320,6 +343,7 @@ class ModelDownloader(private val context: Context) {
             },
             rootTiles = rootTiles,
             tileTraversalOrder = tileTraversalOrder,
+            clientBudgets = clientBudgets,
         )
 
         return StreamBootstrap(
@@ -388,10 +412,45 @@ class ModelDownloader(private val context: Context) {
                         children = item.optJSONArray("children")?.toStringList().orEmpty(),
                         priority = item.optInt("priority", 0),
                         screenCoverageHint = item.optDouble("screenCoverageHint", 0.0),
+                        bounds = parseBounds(item.optJSONObject("bounds")),
                     )
                 )
             }
         }
+    }
+
+    private fun parseClientBudgets(json: JSONObject?): StreamClientBudgets {
+        if (json == null) {
+            return StreamClientBudgets()
+        }
+
+        return StreamClientBudgets(
+            recommendedMaxResidentOverviewStages = json.optInt("recommendedMaxResidentOverviewStages", 1)
+                .coerceAtLeast(1),
+            recommendedMaxActiveTiles = json.optInt("recommendedMaxActiveTiles", 24)
+                .coerceAtLeast(4),
+            recommendedConcurrentTileRequests = json.optInt("recommendedConcurrentTileRequests", 2)
+                .coerceIn(1, 6),
+        )
+    }
+
+    private fun parseBounds(json: JSONObject?): StreamBounds? {
+        if (json == null) {
+            return null
+        }
+
+        val center = json.optJSONArray("center")?.toDoubleList().orEmpty()
+        val radius = json.optDouble("radius", 0.0)
+        if (center.size < 3 || radius <= 0.0) {
+            return null
+        }
+
+        return StreamBounds(
+            min = json.optJSONArray("min")?.toDoubleList().orEmpty(),
+            max = json.optJSONArray("max")?.toDoubleList().orEmpty(),
+            center = center,
+            radius = radius,
+        )
     }
 
     private fun resolveEntryStage(bootstrap: StreamBootstrap): StreamStage? {
@@ -421,78 +480,92 @@ class ModelDownloader(private val context: Context) {
     ): File? = withContext(Dispatchers.IO) {
         val outputFile = File(cacheDir, relativePath)
         if (outputFile.exists() && outputFile.length() > 0L) {
+            markModelAccessed(modelInfo.name)
             return@withContext outputFile
         }
 
         outputFile.parentFile?.mkdirs()
-        val resolvedUrl = assetUrl.ifBlank {
-            if (relativePath.isNotBlank() && modelInfo.assetDirectory.isNotBlank()) {
-                "${modelInfo.assetDirectory.trimEnd('/')}/${relativePath.replace('\\', '/')}"
-            } else {
-                modelInfo.entryUrl
-            }
-        }
 
-        val totalBytes = assetSize.coerceAtLeast(1L)
-        var downloadedBytes = 0L
-        var lastTime = System.currentTimeMillis()
-        var lastBytes = 0L
-
-        val request = Request.Builder()
-            .url(absoluteUrl(resolvedUrl))
-            .get()
-            .build()
-
-        httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                Log.e(TAG, "Failed to download asset $assetId: ${response.code}")
-                return@withContext null
+        try {
+            val resolvedUrl = assetUrl.ifBlank {
+                if (relativePath.isNotBlank() && modelInfo.assetDirectory.isNotBlank()) {
+                    "${modelInfo.assetDirectory.trimEnd('/')}/${relativePath.replace('\\', '/')}"
+                } else {
+                    modelInfo.entryUrl
+                }
             }
 
-            response.body?.byteStream()?.use { input ->
-                outputFile.outputStream().use { output ->
-                    val buffer = ByteArray(16 * 1024)
-                    var read: Int
-                    while (input.read(buffer).also { read = it } != -1) {
-                        output.write(buffer, 0, read)
-                        downloadedBytes += read
-                        val now = System.currentTimeMillis()
-                        val timeDiff = now - lastTime
-                        if (timeDiff > 250) {
-                            val byteDiff = downloadedBytes - lastBytes
-                            val speed = if (timeDiff > 0) (byteDiff * 1000) / timeDiff else 0
-                            val remaining = (totalBytes - downloadedBytes).coerceAtLeast(0L)
-                            val eta = if (speed > 0) remaining / speed else 0
-                            onProgress?.invoke(
-                                DownloadProgress(
-                                    downloadedChunks = assetIndex,
-                                    totalChunks = assetCount.coerceAtLeast(1),
-                                    downloadedBytes = downloadedBytes,
-                                    totalBytes = totalBytes,
-                                    currentSpeed = speed,
-                                    eta = eta
+            val totalBytes = assetSize.coerceAtLeast(1L)
+            var downloadedBytes = 0L
+            var lastTime = System.currentTimeMillis()
+            var lastBytes = 0L
+
+            val request = Request.Builder()
+                .url(absoluteUrl(resolvedUrl))
+                .get()
+                .build()
+
+            executeRequest(request).use { response ->
+                if (!response.isSuccessful) {
+                    Log.e(TAG, "Failed to download asset $assetId: ${response.code}")
+                    return@withContext null
+                }
+
+                response.body?.byteStream()?.use { input ->
+                    outputFile.outputStream().use { output ->
+                        val buffer = ByteArray(16 * 1024)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            currentCoroutineContext().ensureActive()
+                            output.write(buffer, 0, read)
+                            downloadedBytes += read
+                            val now = System.currentTimeMillis()
+                            val timeDiff = now - lastTime
+                            if (timeDiff > 250) {
+                                val byteDiff = downloadedBytes - lastBytes
+                                val speed = if (timeDiff > 0) (byteDiff * 1000) / timeDiff else 0
+                                val remaining = (totalBytes - downloadedBytes).coerceAtLeast(0L)
+                                val eta = if (speed > 0) remaining / speed else 0
+                                onProgress?.invoke(
+                                    DownloadProgress(
+                                        downloadedChunks = assetIndex,
+                                        totalChunks = assetCount.coerceAtLeast(1),
+                                        downloadedBytes = downloadedBytes,
+                                        totalBytes = totalBytes,
+                                        currentSpeed = speed,
+                                        eta = eta
+                                    )
                                 )
-                            )
-                            lastTime = now
-                            lastBytes = downloadedBytes
+                                lastTime = now
+                                lastBytes = downloadedBytes
+                            }
                         }
                     }
                 }
+
+                onProgress?.invoke(
+                    DownloadProgress(
+                        downloadedChunks = assetIndex,
+                        totalChunks = assetCount.coerceAtLeast(1),
+                        downloadedBytes = totalBytes,
+                        totalBytes = totalBytes,
+                        currentSpeed = 0,
+                        eta = 0
+                    )
+                )
             }
+
+            markModelAccessed(modelInfo.name)
+            enforceCacheBudget(preserveModelName = modelInfo.name)
+            outputFile
+        } catch (cancelled: CancellationException) {
+            outputFile.delete()
+            throw cancelled
+        } catch (e: Exception) {
+            outputFile.delete()
+            Log.e(TAG, "Failed to cache asset $assetId", e)
+            null
         }
-
-        onProgress?.invoke(
-            DownloadProgress(
-                downloadedChunks = assetIndex,
-                totalChunks = assetCount.coerceAtLeast(1),
-                downloadedBytes = totalBytes,
-                totalBytes = totalBytes,
-                currentSpeed = 0,
-                eta = 0
-            )
-        )
-
-        outputFile
     }
 
     private fun getModelCacheDir(modelName: String): File {
@@ -522,6 +595,8 @@ class ModelDownloader(private val context: Context) {
             cacheDir.mkdirs()
             val bootstrapFile = File(cacheDir, "stream-bootstrap.json")
             bootstrapFile.writeText(bootstrapToJson(bootstrap).toString(2))
+            markModelAccessed(bootstrap.modelName)
+            enforceCacheBudget(preserveModelName = bootstrap.modelName)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to cache bootstrap for ${bootstrap.modelName}", e)
         }
@@ -560,6 +635,22 @@ class ModelDownloader(private val context: Context) {
                 .put("tiles", JSONArray(bootstrap.manifest.tiles.map(::tileToJson)))
                 .put("rootTiles", JSONArray(bootstrap.manifest.rootTiles))
                 .put("tileTraversalOrder", JSONArray(bootstrap.manifest.tileTraversalOrder))
+                .put(
+                    "clientBudgets",
+                    JSONObject()
+                        .put(
+                            "recommendedMaxResidentOverviewStages",
+                            bootstrap.manifest.clientBudgets.recommendedMaxResidentOverviewStages,
+                        )
+                        .put(
+                            "recommendedMaxActiveTiles",
+                            bootstrap.manifest.clientBudgets.recommendedMaxActiveTiles,
+                        )
+                        .put(
+                            "recommendedConcurrentTileRequests",
+                            bootstrap.manifest.clientBudgets.recommendedConcurrentTileRequests,
+                        ),
+                )
             )
     }
 
@@ -598,7 +689,103 @@ class ModelDownloader(private val context: Context) {
             .put("children", JSONArray(tile.children))
             .put("priority", tile.priority)
             .put("screenCoverageHint", tile.screenCoverageHint)
+            .put(
+                "bounds",
+                tile.bounds?.let {
+                    JSONObject()
+                        .put("min", JSONArray(it.min))
+                        .put("max", JSONArray(it.max))
+                        .put("center", JSONArray(it.center))
+                        .put("radius", it.radius)
+                },
+            )
     }
+
+    private suspend fun executeRequest(request: Request): Response =
+        suspendCancellableCoroutine { continuation ->
+            val call = httpClient.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (!continuation.isCancelled) {
+                        continuation.resumeWithException(e)
+                    }
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    continuation.resume(response)
+                }
+            })
+        }
+
+    private fun markModelAccessed(modelName: String) {
+        val dir = getModelCacheDir(modelName)
+        if (!dir.exists()) {
+            return
+        }
+        val now = System.currentTimeMillis()
+        dir.setLastModified(now)
+        File(dir, "stream-bootstrap.json").takeIf { it.exists() }?.setLastModified(now)
+    }
+
+    private fun enforceCacheBudget(
+        preserveModelName: String? = null,
+        maxBytes: Long = DEFAULT_MAX_CACHE_BYTES,
+    ) {
+        if (!modelsDir.exists()) {
+            return
+        }
+
+        var totalSize = getCacheSize()
+        if (totalSize <= maxBytes) {
+            return
+        }
+
+        val candidates = modelsDir.listFiles()
+            ?.filter { it.isDirectory && it.name != preserveModelName }
+            ?.map { dir ->
+                CachedModelEntry(
+                    name = dir.name,
+                    directory = dir,
+                    size = directorySize(dir),
+                    lastAccess = directoryLastAccess(dir),
+                )
+            }
+            ?.sortedBy { it.lastAccess }
+            .orEmpty()
+
+        for (candidate in candidates) {
+            if (totalSize <= maxBytes) {
+                break
+            }
+            if (candidate.directory.deleteRecursively()) {
+                totalSize -= candidate.size
+                Log.i(TAG, "Evicted cached model ${candidate.name} (${candidate.size} B)")
+            }
+        }
+    }
+
+    private fun directorySize(directory: File): Long {
+        return directory.walkTopDown()
+            .filter { it.isFile }
+            .sumOf { it.length() }
+    }
+
+    private fun directoryLastAccess(directory: File): Long {
+        val dirModified = directory.lastModified()
+        val newestFile = directory.walkTopDown()
+            .filter { it.isFile }
+            .map { it.lastModified() }
+            .maxOrNull() ?: 0L
+        return maxOf(dirModified, newestFile)
+    }
+
+    private data class CachedModelEntry(
+        val name: String,
+        val directory: File,
+        val size: Long,
+        val lastAccess: Long,
+    )
 
     private fun buildUrl(vararg segments: String): String {
         val builder = serverUrl.toHttpUrl().newBuilder()
@@ -617,6 +804,12 @@ class ModelDownloader(private val context: Context) {
     private fun JSONArray.toStringList(): List<String> = buildList {
         for (index in 0 until length()) {
             add(optString(index))
+        }
+    }
+
+    private fun JSONArray.toDoubleList(): List<Double> = buildList {
+        for (index in 0 until length()) {
+            add(optDouble(index))
         }
     }
 }
