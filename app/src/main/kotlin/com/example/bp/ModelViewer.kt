@@ -73,6 +73,7 @@ private class FilamentState(
     val resourceLoader: ResourceLoader
 ) {
     private var overviewAsset: FilamentAsset? = null
+    private var overviewVisible = false
     private val tileAssets = linkedMapOf<String, FilamentAsset>()
     private val resolvedTileIds = linkedSetOf<String>()
 
@@ -122,6 +123,8 @@ private class FilamentState(
 
     fun visibleTileCount(): Int = tileAssets.size
 
+    fun visibleTileIds(): List<String> = tileAssets.keys.toList()
+
     private fun updateBoundsFromAsset(asset: FilamentAsset) {
         val center = asset.boundingBox.center
         modelCenter[0] = center[0]
@@ -135,23 +138,46 @@ private class FilamentState(
         updateCamera()
     }
 
-    fun setOverviewAsset(newAsset: FilamentAsset) {
+    fun setOverviewAsset(newAsset: FilamentAsset, updateViewBounds: Boolean) {
+        val shouldShowOverview = overviewAsset == null || overviewVisible
         overviewAsset?.let { previous ->
             scene.removeEntities(previous.entities)
             assetLoader.destroyAsset(previous)
         }
 
-        scene.addEntities(newAsset.entities)
-        updateBoundsFromAsset(newAsset)
         overviewAsset = newAsset
+        overviewVisible = shouldShowOverview
+        if (shouldShowOverview) {
+            scene.addEntities(newAsset.entities)
+        }
+        if (updateViewBounds) {
+            updateBoundsFromAsset(newAsset)
+        }
     }
 
     fun hideOverview() {
+        val asset = overviewAsset ?: return
+        if (!overviewVisible) return
+        scene.removeEntities(asset.entities)
+        overviewVisible = false
+    }
+
+    fun showOverview() {
+        val asset = overviewAsset ?: return
+        if (overviewVisible) return
+        scene.addEntities(asset.entities)
+        overviewVisible = true
+    }
+
+    fun destroyOverview() {
         overviewAsset?.let { asset ->
-            scene.removeEntities(asset.entities)
+            if (overviewVisible) {
+                scene.removeEntities(asset.entities)
+            }
             assetLoader.destroyAsset(asset)
         }
         overviewAsset = null
+        overviewVisible = false
     }
 
     fun registerTile(tileId: String, asset: FilamentAsset, updateViewBounds: Boolean = false) {
@@ -182,12 +208,16 @@ private class FilamentState(
         resolvedTileIds.add(tileId)
     }
 
+    fun forgetTile(tileId: String) {
+        resolvedTileIds.remove(tileId)
+    }
+
     fun areTilesResolved(tileIds: Collection<String>): Boolean {
         return tileIds.isNotEmpty() && tileIds.all(::isTileResolved)
     }
 
     fun clearSceneAssets() {
-        hideOverview()
+        destroyOverview()
         tileAssets.keys.toList().forEach(::removeTile)
         resolvedTileIds.clear()
     }
@@ -315,26 +345,31 @@ fun ModelViewer(
     fun nextTilesToLoad(
         state: FilamentState,
         currentSession: StreamSession,
+        rootTiles: List<StreamTile>,
         refinementTiles: List<StreamTile>,
-        rootTileCount: Int,
     ): List<StreamTile> {
         val budgets = currentSession.bootstrap.manifest.clientBudgets
-        val maxActiveTiles = budgets.recommendedMaxActiveTiles.coerceAtLeast(rootTileCount)
+        val maxActiveTiles = budgets.recommendedMaxActiveTiles
+            .coerceAtLeast(4)
+            .coerceAtMost(8)
+        val rootTileCount = rootTiles.size
         val visibleTiles = state.visibleTileCount()
         if (visibleTiles >= maxActiveTiles) return emptyList()
 
         val zoomFactor = state.zoomFactor()
-        val targetVisible = (rootTileCount + ((maxActiveTiles - rootTileCount) * zoomFactor))
+        val minimumVisible = minOf(rootTileCount, (maxActiveTiles / 2).coerceAtLeast(4))
+        val targetVisible = (minimumVisible + ((maxActiveTiles - minimumVisible) * zoomFactor))
             .toInt()
-            .coerceAtLeast(rootTileCount)
+            .coerceAtLeast(minimumVisible)
             .coerceAtMost(maxActiveTiles)
 
         val loadBudget = (targetVisible - visibleTiles).coerceAtLeast(0)
         if (loadBudget == 0) return emptyList()
 
-        val maxConcurrent = budgets.recommendedConcurrentTileRequests.coerceIn(1, 6)
+        val maxConcurrent = budgets.recommendedConcurrentTileRequests.coerceIn(1, 2)
+        val candidates = rootTiles + refinementTiles
 
-        return refinementTiles
+        return candidates
             .asSequence()
             .filter { !state.isTileResolved(it.id) }
             .filter { tile ->
@@ -343,6 +378,7 @@ fun ModelViewer(
             }
             .sortedWith(
                 compareBy<StreamTile>(
+                    { if (it.parentId == null) 0 else 1 },
                     { tileDistanceScore(state, it) },
                     { it.priority.takeIf { value -> value > 0 } ?: Int.MAX_VALUE },
                     { it.depth },
@@ -350,6 +386,58 @@ fun ModelViewer(
             )
             .take(loadBudget.coerceAtMost(maxConcurrent))
             .toList()
+    }
+
+    fun desiredOverviewStageIndex(state: FilamentState, overviewStages: List<StreamStage>): Int {
+        if (overviewStages.isEmpty()) return -1
+        val zoom = state.zoomFactor()
+        return when {
+            overviewStages.size >= 3 && zoom >= 0.65 -> 2
+            overviewStages.size >= 2 && zoom >= 0.35 -> 1
+            else -> 0
+        }.coerceAtMost(overviewStages.lastIndex)
+    }
+
+    fun shouldUseDetailMode(state: FilamentState, rootTiles: List<StreamTile>): Boolean {
+        if (rootTiles.isEmpty()) return false
+        val minimumDetailTiles = minOf(rootTiles.size, 4)
+        return state.zoomFactor() >= 0.55 && state.visibleTileCount() >= minimumDetailTiles
+    }
+
+    fun pruneVisibleTiles(
+        state: FilamentState,
+        currentSession: StreamSession,
+        tileMap: Map<String, StreamTile>,
+        rootTiles: List<StreamTile>,
+    ) {
+        val maxActiveTiles = currentSession.bootstrap.manifest.clientBudgets.recommendedMaxActiveTiles
+            .coerceAtLeast(4)
+            .coerceAtMost(8)
+        val rootTileCount = rootTiles.size
+        val zoomFactor = state.zoomFactor()
+        val minimumVisible = minOf(rootTileCount, (maxActiveTiles / 2).coerceAtLeast(4))
+        val targetVisible = (minimumVisible + ((maxActiveTiles - minimumVisible) * zoomFactor))
+            .toInt()
+            .coerceAtLeast(minimumVisible)
+            .coerceAtMost(maxActiveTiles)
+
+        if (state.visibleTileCount() <= targetVisible) return
+
+        val removableTiles = state.visibleTileIds()
+            .mapNotNull(tileMap::get)
+            .filter { tile -> tile.children.none(state::isTileVisible) }
+            .sortedWith(
+                compareByDescending<StreamTile> { tileDistanceScore(state, it) }
+                    .thenBy { if (it.parentId == null) 0 else 1 }
+                    .thenByDescending { it.depth }
+                    .thenByDescending { it.priority }
+            )
+
+        removableTiles.forEach { tile ->
+            if (state.visibleTileCount() <= targetVisible) return
+            state.removeTile(tile.id)
+            state.forgetTile(tile.id)
+        }
     }
 
     suspend fun createAsset(state: FilamentState, file: File, label: String): FilamentAsset? {
@@ -383,7 +471,7 @@ fun ModelViewer(
             return
         }
 
-        state.setOverviewAsset(asset)
+        state.setOverviewAsset(asset, updateViewBounds = false)
     }
 
     fun promoteResolvedTiles(
@@ -435,19 +523,32 @@ fun ModelViewer(
     LaunchedEffect(session, filamentState) {
         val state = filamentState ?: return@LaunchedEffect
         val entryStage = entryOverviewStage(session)
+        val overviewStages = overviewSequence(session)
         val rootTiles = rootTileSequence(session)
         val refinementTiles = refinementTileSequence(session)
         val tileMap = session.bootstrap.manifest.tiles.associateBy { it.id }
-        val clientBudgets = session.bootstrap.manifest.clientBudgets
 
         loadToken += 1
         val token = loadToken
         var firstVisualDelivered = false
+        var currentOverviewIndex = overviewStages.indexOfFirst { it.id == entryStage?.id }
 
         state.clearSceneAssets()
 
         if (entryStage != null) {
-            loadStage(state, entryStage, token)
+            val stageFile = downloader.ensureOverviewStageCached(
+                session = session,
+                stage = entryStage,
+                stageIndex = (currentOverviewIndex.coerceAtLeast(0) + 1),
+                stageCount = overviewStages.size.coerceAtLeast(1),
+            ) ?: return@LaunchedEffect
+            if (token != loadToken) return@LaunchedEffect
+            val asset = createAsset(state, stageFile, entryStage.id) ?: return@LaunchedEffect
+            if (token != loadToken) {
+                state.assetLoader.destroyAsset(asset)
+                return@LaunchedEffect
+            }
+            state.setOverviewAsset(asset, updateViewBounds = true)
             if (token != loadToken) return@LaunchedEffect
             if (!firstVisualDelivered) {
                 onModelLoaded?.invoke()
@@ -455,34 +556,27 @@ fun ModelViewer(
             }
         }
 
-        val rootBudget = clientBudgets.recommendedMaxActiveTiles.coerceAtLeast(1)
-        rootTiles.forEachIndexed { index, tile ->
-            if (index >= rootBudget) return@forEachIndexed
-            loadTile(
-                state = state,
-                tile = tile,
-                tileIndex = index + 1,
-                tileCount = rootTiles.size,
-                token = token,
-                updateViewBounds = entryStage == null && index == 0,
-            )
-            if (token != loadToken) return@LaunchedEffect
-            if (!firstVisualDelivered && state.isTileVisible(tile.id)) {
-                onModelLoaded?.invoke()
-                firstVisualDelivered = true
-            }
-        }
-
-        if (state.areTilesResolved(rootTiles.map { it.id })) {
-            state.hideOverview()
-        }
-
         while (token == loadToken) {
+            val desiredOverviewIndex = desiredOverviewStageIndex(state, overviewStages)
+            if (currentOverviewIndex in 0 until desiredOverviewIndex) {
+                val nextIndex = currentOverviewIndex + 1
+                loadStage(state, overviewStages[nextIndex], token)
+                if (token != loadToken) return@LaunchedEffect
+                currentOverviewIndex = nextIndex
+            }
+
+            pruneVisibleTiles(
+                state = state,
+                currentSession = session,
+                tileMap = tileMap,
+                rootTiles = rootTiles,
+            )
+
             val nextTiles = nextTilesToLoad(
                 state = state,
                 currentSession = session,
+                rootTiles = rootTiles,
                 refinementTiles = refinementTiles,
-                rootTileCount = rootTiles.size,
             )
 
             if (nextTiles.isEmpty()) {
@@ -505,9 +599,12 @@ fun ModelViewer(
                 }
 
                 promoteResolvedTiles(state, tileMap, tile.id)
-                if (state.areTilesResolved(rootTiles.map { it.id })) {
-                    state.hideOverview()
-                }
+            }
+
+            if (shouldUseDetailMode(state, rootTiles)) {
+                state.hideOverview()
+            } else {
+                state.showOverview()
             }
 
             delay(50)

@@ -196,7 +196,7 @@ class ModelDownloader(private val context: Context) {
                 return File(getModelCacheDir(bootstrap.modelName), entryStage.file).exists()
             }
         }
-        return getModelCacheDir(modelKey).exists()
+        return false
     }
 
     fun getCachedSession(modelInfo: ModelInfo): StreamSession? {
@@ -217,12 +217,19 @@ class ModelDownloader(private val context: Context) {
         )
     }
 
-    fun deleteModel(modelKey: String): Boolean {
+    fun clearCache(): Boolean {
         return try {
-            val cacheDir = getModelCacheDir(modelKey)
-            cacheDir.exists() && cacheDir.deleteRecursively()
+            if (modelsDir.exists()) {
+                modelsDir.deleteRecursively()
+            } else {
+                true
+            }.also {
+                if (it) {
+                    modelsDir.mkdirs()
+                }
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Error deleting cached model", e)
+            Log.e(TAG, "Error clearing cache", e)
             false
         }
     }
@@ -243,11 +250,11 @@ class ModelDownloader(private val context: Context) {
         val name = json.optString("name")
         return ModelInfo(
             name = name,
-            entryFile = json.optString("entryFile"),
-            entryUrl = json.optString("entryUrl"),
-            assetDirectory = json.optString("assetDirectory"),
-            manifestUrl = json.optString("manifestUrl"),
-            bootstrapUrl = json.optString("bootstrapUrl"),
+            entryFile = normalizeServerPath(json.optString("entryFile")),
+            entryUrl = normalizeServerPath(json.optString("entryUrl")),
+            assetDirectory = normalizeServerPath(json.optString("assetDirectory")),
+            manifestUrl = normalizeServerPath(json.optString("manifestUrl")),
+            bootstrapUrl = normalizeServerPath(json.optString("bootstrapUrl")),
             streamingStrategy = json.optString("streamingStrategy"),
             upgradeOrder = upgradeOrder,
             overviewStageCount = json.optInt("overviewStageCount", 0),
@@ -274,11 +281,11 @@ class ModelDownloader(private val context: Context) {
         val metadata = StreamMetadata(
             modelName = metadataJson.optString("modelName", modelName),
             type = metadataJson.optString("type", "mesh-stream-package"),
-            entryFile = metadataJson.optString("entryFile"),
-            entryUrl = metadataJson.optString("entryUrl"),
-            assetDirectory = metadataJson.optString("assetDirectory"),
-            manifestUrl = metadataJson.optString("manifestUrl"),
-            bootstrapUrl = metadataJson.optString("bootstrapUrl"),
+            entryFile = normalizeServerPath(metadataJson.optString("entryFile")),
+            entryUrl = normalizeServerPath(metadataJson.optString("entryUrl")),
+            assetDirectory = normalizeServerPath(metadataJson.optString("assetDirectory")),
+            manifestUrl = normalizeServerPath(metadataJson.optString("manifestUrl")),
+            bootstrapUrl = normalizeServerPath(metadataJson.optString("bootstrapUrl")),
             streamingStrategy = metadataJson.optString("streamingStrategy"),
             entryStage = metadataJson.optString("entryStage"),
             upgradeOrder = metadataJson.optJSONArray("upgradeOrder")?.toStringList().orEmpty(),
@@ -307,8 +314,9 @@ class ModelDownloader(private val context: Context) {
             upgradeOrder = manifestJson.optJSONArray("upgradeOrder")?.toStringList().orEmpty(),
             firstFrameStageId = bootstrapSection?.optString("firstFrameStageId")
                 ?: metadata.entryStage,
-            firstFrameUrl = bootstrapSection?.optString("firstFrameUrl")
-                ?: metadata.entryUrl,
+            firstFrameUrl = normalizeServerPath(
+                bootstrapSection?.optString("firstFrameUrl") ?: metadata.entryUrl,
+            ),
             firstFrameSize = bootstrapSection?.optLong("firstFrameSize") ?: 0L,
             overviewStages = if (manifestStages.isNotEmpty()) manifestStages else overviewStages,
             tiles = manifestTiles,
@@ -342,8 +350,8 @@ class ModelDownloader(private val context: Context) {
                 add(
                     StreamStage(
                         id = id,
-                        file = file,
-                        url = item.optString("url"),
+                        file = normalizeServerPath(file),
+                        url = normalizeServerPath(item.optString("url")),
                         size = item.optLong("size", 0L),
                         ratio = item.optDouble("ratio", 0.0),
                         error = item.optDouble("error", 0.0),
@@ -376,8 +384,8 @@ class ModelDownloader(private val context: Context) {
                         depth = item.optInt("depth", 0),
                         refinement = item.optString("refinement", "replace"),
                         format = item.optString("format", "glb"),
-                        file = file,
-                        url = item.optString("url"),
+                        file = normalizeServerPath(file),
+                        url = normalizeServerPath(item.optString("url")),
                         size = item.optLong("size", 0L),
                         ratio = item.optDouble("ratio", 0.0),
                         error = item.optDouble("error", 0.0),
@@ -549,18 +557,25 @@ class ModelDownloader(private val context: Context) {
     }
 
     private fun getLocalBootstrap(modelName: String): StreamBootstrap? {
+        val cacheDir = getModelCacheDir(modelName)
         return try {
-            val bootstrapFile = File(getModelCacheDir(modelName), "stream-bootstrap.json")
+            val bootstrapFile = File(cacheDir, "stream-bootstrap.json")
             if (!bootstrapFile.exists()) return null
+            if (bootstrapFile.length() == 0L) {
+                cacheDir.deleteRecursively()
+                return null
+            }
             val bootstrap = parseBootstrap(modelName, JSONObject(bootstrapFile.readText()))
             if (bootstrap.manifest.tileCount > 0 && bootstrap.manifest.tiles.isEmpty()) {
                 Log.w(TAG, "Cached bootstrap for $modelName is missing tile metadata, refetching")
+                cacheDir.deleteRecursively()
                 null
             } else {
                 bootstrap
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to read cached bootstrap for $modelName", e)
+            cacheDir.deleteRecursively()
             null
         }
     }
@@ -769,11 +784,16 @@ class ModelDownloader(private val context: Context) {
         return builder.build().toString()
     }
 
+    private fun normalizeServerPath(path: String): String {
+        return path.replace('\\', '/')
+    }
+
     private fun absoluteUrl(path: String): String {
-        return if (path.startsWith("http://") || path.startsWith("https://")) {
-            path
+        val normalizedPath = normalizeServerPath(path)
+        return if (normalizedPath.startsWith("http://") || normalizedPath.startsWith("https://")) {
+            normalizedPath
         } else {
-            buildUrl(*path.trimStart('/').split('/').filter { it.isNotBlank() }.toTypedArray())
+            buildUrl(*normalizedPath.trimStart('/').split('/').filter { it.isNotBlank() }.toTypedArray())
         }
     }
 

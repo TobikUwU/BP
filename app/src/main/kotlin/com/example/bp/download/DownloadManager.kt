@@ -18,6 +18,6 @@ class DownloadManager(private val context: Context) {
 
     suspend fun getAvailableModels(): List<ModelInfo> = modelDownloader.getAvailableModels()
     fun isModelDownloaded(modelName: String): Boolean = modelDownloader.isModelDownloaded(modelName)
-    fun deleteModel(modelName: String): Boolean = modelDownloader.deleteModel(modelName)
+    fun clearCache(): Boolean = modelDownloader.clearCache()
     fun getCacheSize(): Long = modelDownloader.getCacheSize()
 }

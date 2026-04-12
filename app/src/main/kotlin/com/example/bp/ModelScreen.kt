@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -27,6 +26,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -130,10 +130,35 @@ fun ModelScreen() {
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        if (cacheSize > 0) {
+                            Text(
+                                "Cache: ${formatBytes(cacheSize)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
                     }
 
-                    IconButton(onClick = { scope.launch { refreshModels() } }, enabled = !isLoading) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Obnovit")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (cacheSize > 0) {
+                            OutlinedButton(
+                                onClick = {
+                                    downloadJob?.cancel()
+                                    if (downloadManager.clearCache()) {
+                                        activeSession = null
+                                        cacheSize = 0L
+                                        Toast.makeText(context, "Cache vyčištěna", Toast.LENGTH_SHORT).show()
+                                    }
+                                },
+                                enabled = !isLoading
+                            ) {
+                                Text("Vyčistit cache")
+                            }
+                        }
+
+                        IconButton(onClick = { scope.launch { refreshModels() } }, enabled = !isLoading) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Obnovit")
+                        }
                     }
                 }
 
@@ -170,22 +195,11 @@ fun ModelScreen() {
                                                 "${model.overviewStageCount} overview • ${model.tileCount} tiles • ${model.sizeInMB} MB",
                                                 style = MaterialTheme.typography.bodySmall
                                             )
-                                        }
-
-                                        if (downloadManager.isModelDownloaded(model.name)) {
-                                            IconButton(onClick = {
-                                                if (downloadManager.deleteModel(model.name)) {
-                                                    if (activeSession?.model?.name == model.name) {
-                                                        activeSession = null
-                                                    }
-                                                    Toast.makeText(context, "Model ${model.name} smazán", Toast.LENGTH_SHORT).show()
-                                                    cacheSize = downloadManager.getCacheSize()
-                                                }
-                                            }) {
-                                                Icon(
-                                                    Icons.Default.Delete,
-                                                    contentDescription = "Smazat",
-                                                    tint = MaterialTheme.colorScheme.error
+                                            if (downloadManager.isModelDownloaded(model.name)) {
+                                                Text(
+                                                    "V cache",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.primary
                                                 )
                                             }
                                         }
@@ -221,6 +235,11 @@ fun ModelScreen() {
                             Text("Detail tiles: ${model.tileCount}", style = MaterialTheme.typography.bodySmall)
                             if (model.upgradeOrder.isNotEmpty()) {
                                 Text("Upgrade order: ${model.upgradeOrder.joinToString(" → ")}", style = MaterialTheme.typography.bodySmall)
+                            }
+                            if (downloadManager.isModelDownloaded(model.name)) {
+                                Text("Status: v cache", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                            } else {
+                                Text("Status: není v cache", style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -303,11 +322,6 @@ fun ModelScreen() {
                             }
                         }
                     }
-                }
-
-                if (cacheSize > 0) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("Cache: ${formatBytes(cacheSize)}", style = MaterialTheme.typography.bodySmall)
                 }
 
                 errorMessage?.let { error ->
