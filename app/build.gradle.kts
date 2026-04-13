@@ -1,3 +1,27 @@
+import java.util.Properties
+
+fun String.asBuildConfigString(): String =
+    "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+fun firstNonBlank(vararg values: String?): String? =
+    values.firstOrNull { !it.isNullOrBlank() }?.trim()
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use(::load)
+    }
+}
+
+val defaultServerBaseUrl = "https://192.168.50.96:3443"
+val serverBaseUrl = (
+    firstNonBlank(
+        providers.gradleProperty("serverBaseUrl").orNull,
+        System.getenv("SERVER_BASE_URL"),
+        localProperties.getProperty("serverBaseUrl"),
+    ) ?: defaultServerBaseUrl
+).removeSuffix("/")
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -22,6 +46,7 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("String", "SERVER_BASE_URL", serverBaseUrl.asBuildConfigString())
     }
 
     buildTypes {
@@ -42,6 +67,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     sourceSets {
         getByName("main") {

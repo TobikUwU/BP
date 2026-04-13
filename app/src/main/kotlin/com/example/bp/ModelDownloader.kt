@@ -33,7 +33,7 @@ import kotlin.coroutines.resumeWithException
 
 class ModelDownloader(private val context: Context) {
 
-    private val serverUrl = "https://192.168.50.96:3443"
+    private val serverUrl = BuildConfig.SERVER_BASE_URL
     private val httpClient = Http2ClientManager.client
     private val modelsDir = File(context.cacheDir, "stream-models")
 
