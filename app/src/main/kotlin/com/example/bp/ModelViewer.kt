@@ -6,16 +6,25 @@ import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceView
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Surface as ComposeSurface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.bp.download.StreamSession
 import com.example.bp.download.StreamStage
@@ -40,6 +49,8 @@ import com.google.android.filament.utils.KTX1Loader
 import com.google.android.filament.utils.Utils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
@@ -48,6 +59,12 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
+
+private const val TAG = "ModelViewer"
+private const val TILE_LOAD_TIMEOUT_MS = 20_000L
+private const val CAMERA_ROTATION_SENSITIVITY = 0.25
+private const val CAMERA_MIN_PITCH = -80.0
+private const val CAMERA_MAX_PITCH = 80.0
 
 private fun loadAssetAsByteBuffer(context: android.content.Context, assetName: String): ByteBuffer {
     context.assets.open(assetName).use { input ->
@@ -61,6 +78,20 @@ private fun loadFileAsByteBuffer(file: File): ByteBuffer {
         .order(ByteOrder.nativeOrder())
         .put(bytes)
         .apply { flip() }
+}
+
+private fun normalize(vector: DoubleArray): DoubleArray? {
+    val length = sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2])
+    if (length <= 1e-6) return null
+    return doubleArrayOf(vector[0] / length, vector[1] / length, vector[2] / length)
+}
+
+private fun cross(a: DoubleArray, b: DoubleArray): DoubleArray {
+    return doubleArrayOf(
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
 }
 
 private class FilamentState(
@@ -78,26 +109,31 @@ private class FilamentState(
     private val resolvedTileIds = linkedSetOf<String>()
 
     val modelCenter = FloatArray(3)
+    private val cameraTarget = DoubleArray(3)
     var cameraDistance = 6.0
     var cameraAngleX = 0.0
     var cameraAngleY = 20.0
     private var modelExtent = 1.0
 
+    private fun minimumCameraDistance(): Double = (modelExtent * 1.4).coerceAtLeast(0.75)
+
+    private fun maximumCameraDistance(): Double = (modelExtent * 10.0).coerceAtLeast(minimumCameraDistance() + 4.0)
+
     fun updateCamera() {
         val angleXRad = cameraAngleX * PI / 180.0
         val angleYRad = cameraAngleY * PI / 180.0
 
-        val eyeX = modelCenter[0] + cameraDistance * cos(angleYRad) * sin(angleXRad)
-        val eyeY = modelCenter[1] + cameraDistance * sin(angleYRad)
-        val eyeZ = modelCenter[2] + cameraDistance * cos(angleYRad) * cos(angleXRad)
+        val eyeX = cameraTarget[0] + cameraDistance * cos(angleYRad) * sin(angleXRad)
+        val eyeY = cameraTarget[1] + cameraDistance * sin(angleYRad)
+        val eyeZ = cameraTarget[2] + cameraDistance * cos(angleYRad) * cos(angleXRad)
 
         camera.lookAt(
             eyeX,
             eyeY,
             eyeZ,
-            modelCenter[0].toDouble(),
-            modelCenter[1].toDouble(),
-            modelCenter[2].toDouble(),
+            cameraTarget[0],
+            cameraTarget[1],
+            cameraTarget[2],
             0.0,
             1.0,
             0.0
@@ -107,18 +143,48 @@ private class FilamentState(
     fun cameraPosition(): DoubleArray {
         val angleXRad = cameraAngleX * PI / 180.0
         val angleYRad = cameraAngleY * PI / 180.0
-        val eyeX = modelCenter[0] + cameraDistance * cos(angleYRad) * sin(angleXRad)
-        val eyeY = modelCenter[1] + cameraDistance * sin(angleYRad)
-        val eyeZ = modelCenter[2] + cameraDistance * cos(angleYRad) * cos(angleXRad)
+        val eyeX = cameraTarget[0] + cameraDistance * cos(angleYRad) * sin(angleXRad)
+        val eyeY = cameraTarget[1] + cameraDistance * sin(angleYRad)
+        val eyeZ = cameraTarget[2] + cameraDistance * cos(angleYRad) * cos(angleXRad)
         return doubleArrayOf(eyeX, eyeY, eyeZ)
     }
 
     fun zoomFactor(): Double {
-        val nearDistance = (modelExtent * 1.8).coerceAtLeast(1.0)
-        val farDistance = (modelExtent * 7.5).coerceAtLeast(nearDistance + 1.0)
+        val nearDistance = minimumCameraDistance()
+        val farDistance = maximumCameraDistance()
         val normalized = ((cameraDistance - nearDistance) / (farDistance - nearDistance))
             .coerceIn(0.0, 1.0)
         return 1.0 - normalized
+    }
+
+    fun zoomBy(scale: Double) {
+        if (!scale.isFinite() || scale <= 0.0) return
+        cameraDistance = (cameraDistance * scale).coerceIn(minimumCameraDistance(), maximumCameraDistance())
+    }
+
+    fun panBy(deltaX: Float, deltaY: Float, viewportWidth: Int, viewportHeight: Int) {
+        if (viewportWidth <= 0 || viewportHeight <= 0) return
+
+        val eye = cameraPosition()
+        val forward = normalize(
+            doubleArrayOf(
+                cameraTarget[0] - eye[0],
+                cameraTarget[1] - eye[1],
+                cameraTarget[2] - eye[2],
+            ),
+        ) ?: return
+        val worldUp = doubleArrayOf(0.0, 1.0, 0.0)
+        val right = normalize(cross(forward, worldUp)) ?: doubleArrayOf(1.0, 0.0, 0.0)
+        val up = normalize(cross(right, forward)) ?: worldUp
+
+        val referenceSize = minOf(viewportWidth, viewportHeight).coerceAtLeast(1)
+        val panScale = (cameraDistance * 1.5) / referenceSize.toDouble()
+        val moveX = -deltaX * panScale
+        val moveY = deltaY * panScale
+
+        cameraTarget[0] += right[0] * moveX + up[0] * moveY
+        cameraTarget[1] += right[1] * moveX + up[1] * moveY
+        cameraTarget[2] += right[2] * moveX + up[2] * moveY
     }
 
     fun visibleTileCount(): Int = tileAssets.size
@@ -134,7 +200,12 @@ private class FilamentState(
         val halfExtent = asset.boundingBox.halfExtent
         val maxExtent = maxOf(halfExtent[0], halfExtent[1], halfExtent[2])
         modelExtent = maxExtent.toDouble().coerceAtLeast(1.0)
-        cameraDistance = (maxExtent * 3.5).coerceAtLeast(6.0)
+        cameraTarget[0] = center[0].toDouble()
+        cameraTarget[1] = center[1].toDouble()
+        cameraTarget[2] = center[2].toDouble()
+        cameraAngleX = 0.0
+        cameraAngleY = 20.0
+        cameraDistance = (maxExtent * 3.5).coerceIn(minimumCameraDistance(), maximumCameraDistance())
         updateCamera()
     }
 
@@ -234,6 +305,17 @@ fun ModelViewer(
     val downloader = remember(context) { ModelDownloader(context) }
     var filamentState by remember { mutableStateOf<FilamentState?>(null) }
     var loadToken by remember { mutableIntStateOf(0) }
+    val loadingTileIds = remember(session.model.name) { mutableStateListOf<String>() }
+    var visibleTileCount by remember(session.model.name) { mutableIntStateOf(0) }
+    var tileStatusMessage by remember(session.model.name) {
+        mutableStateOf("Čekám na detailní tiles")
+    }
+
+    fun updateTileStatus(message: String) {
+        if (tileStatusMessage == message) return
+        tileStatusMessage = message
+        Log.d(TAG, message)
+    }
 
     fun overviewSequence(currentSession: StreamSession): List<StreamStage> {
         val stages = currentSession.bootstrap.manifest.overviewStages
@@ -347,13 +429,14 @@ fun ModelViewer(
         currentSession: StreamSession,
         rootTiles: List<StreamTile>,
         refinementTiles: List<StreamTile>,
+        activeTileIds: Set<String>,
     ): List<StreamTile> {
         val budgets = currentSession.bootstrap.manifest.clientBudgets
         val maxActiveTiles = budgets.recommendedMaxActiveTiles
             .coerceAtLeast(4)
             .coerceAtMost(8)
         val rootTileCount = rootTiles.size
-        val visibleTiles = state.visibleTileCount()
+        val visibleTiles = state.visibleTileCount() + activeTileIds.size
         if (visibleTiles >= maxActiveTiles) return emptyList()
 
         val zoomFactor = state.zoomFactor()
@@ -367,11 +450,14 @@ fun ModelViewer(
         if (loadBudget == 0) return emptyList()
 
         val maxConcurrent = budgets.recommendedConcurrentTileRequests.coerceIn(1, 2)
+        val availableRequestSlots = (maxConcurrent - activeTileIds.size).coerceAtLeast(0)
+        if (availableRequestSlots == 0) return emptyList()
         val candidates = rootTiles + refinementTiles
 
         return candidates
             .asSequence()
             .filter { !state.isTileResolved(it.id) }
+            .filter { it.id !in activeTileIds }
             .filter { tile ->
                 val parentId = tile.parentId
                 parentId == null || state.isTileResolved(parentId) || state.isTileVisible(parentId)
@@ -384,7 +470,7 @@ fun ModelViewer(
                     { it.depth },
                 ),
             )
-            .take(loadBudget.coerceAtMost(maxConcurrent))
+            .take(loadBudget.coerceAtMost(availableRequestSlots))
             .toList()
     }
 
@@ -444,7 +530,7 @@ fun ModelViewer(
         val buffer = withContext(Dispatchers.IO) { loadFileAsByteBuffer(file) }
         val asset = state.assetLoader.createAsset(buffer)
         if (asset == null) {
-            Log.e("ModelViewer", "Failed to create GLB asset for $label")
+            Log.e(TAG, "Failed to create GLB asset for $label")
             return null
         }
 
@@ -456,6 +542,7 @@ fun ModelViewer(
     suspend fun loadStage(state: FilamentState, stage: StreamStage, token: Int) {
         val sequence = overviewSequence(session)
         val stageIndex = sequence.indexOfFirst { it.id == stage.id }.coerceAtLeast(0) + 1
+        updateTileStatus("Načítám overview stage ${stage.id}")
         val stageFile = downloader.ensureOverviewStageCached(
             session = session,
             stage = stage,
@@ -472,6 +559,7 @@ fun ModelViewer(
         }
 
         state.setOverviewAsset(asset, updateViewBounds = false)
+        updateTileStatus("Overview stage ${stage.id} připravena")
     }
 
     fun promoteResolvedTiles(
@@ -501,23 +589,39 @@ fun ModelViewer(
         tileCount: Int,
         token: Int,
         updateViewBounds: Boolean,
-    ) {
-        val tileFile = downloader.ensureTileCached(
-            session = session,
-            tile = tile,
-            tileIndex = tileIndex,
-            tileCount = tileCount,
-        ) ?: return
+    ): Boolean {
+        updateTileStatus("Načítám detail tile ${tile.id} ($tileIndex/$tileCount)")
 
-        if (token != loadToken) return
+        val tileFile = withTimeoutOrNull(TILE_LOAD_TIMEOUT_MS) {
+            downloader.ensureTileCached(
+                session = session,
+                tile = tile,
+                tileIndex = tileIndex,
+                tileCount = tileCount,
+            )
+        }
 
-        val asset = createAsset(state, tileFile, tile.id) ?: return
+        if (tileFile == null) {
+            updateTileStatus("Tile ${tile.id} timeout nebo chyba při downloadu")
+            Log.w(TAG, "Tile ${tile.id} failed or timed out after ${TILE_LOAD_TIMEOUT_MS}ms")
+            return false
+        }
+
+        if (token != loadToken) return false
+
+        val asset = createAsset(state, tileFile, tile.id) ?: run {
+            updateTileStatus("Tile ${tile.id} se nepodařilo vytvořit")
+            return false
+        }
         if (token != loadToken) {
             state.assetLoader.destroyAsset(asset)
-            return
+            return false
         }
 
         state.registerTile(tile.id, asset, updateViewBounds)
+        visibleTileCount = state.visibleTileCount()
+        updateTileStatus("Detail tile ${tile.id} načtena, viditelných ${state.visibleTileCount()}")
+        return true
     }
 
     LaunchedEffect(session, filamentState) {
@@ -534,8 +638,12 @@ fun ModelViewer(
         var currentOverviewIndex = overviewStages.indexOfFirst { it.id == entryStage?.id }
 
         state.clearSceneAssets()
+        loadingTileIds.clear()
+        visibleTileCount = 0
+        updateTileStatus("Připravuji stream pro ${session.model.name}")
 
         if (entryStage != null) {
+            updateTileStatus("Načítám vstupní overview stage ${entryStage.id}")
             val stageFile = downloader.ensureOverviewStageCached(
                 session = session,
                 stage = entryStage,
@@ -550,6 +658,7 @@ fun ModelViewer(
             }
             state.setOverviewAsset(asset, updateViewBounds = true)
             if (token != loadToken) return@LaunchedEffect
+            updateTileStatus("Vstupní overview stage ${entryStage.id} připravena")
             if (!firstVisualDelivered) {
                 onModelLoaded?.invoke()
                 firstVisualDelivered = true
@@ -571,34 +680,49 @@ fun ModelViewer(
                 tileMap = tileMap,
                 rootTiles = rootTiles,
             )
+            visibleTileCount = state.visibleTileCount()
 
             val nextTiles = nextTilesToLoad(
                 state = state,
                 currentSession = session,
                 rootTiles = rootTiles,
                 refinementTiles = refinementTiles,
+                activeTileIds = loadingTileIds.toSet(),
             )
 
             if (nextTiles.isEmpty()) {
+                if (loadingTileIds.isNotEmpty()) {
+                    updateTileStatus("Čekám na ${loadingTileIds.size} rozpracované detail tiles")
+                }
                 delay(250)
                 continue
             }
 
             nextTiles.forEachIndexed { index, tile ->
-                loadTile(
-                    state = state,
-                    tile = tile,
-                    tileIndex = index + 1,
-                    tileCount = nextTiles.size,
-                    token = token,
-                    updateViewBounds = false,
-                )
-                if (token != loadToken) return@LaunchedEffect
-                if (!state.isTileVisible(tile.id)) {
-                    return@forEachIndexed
+                if (tile.id !in loadingTileIds) {
+                    loadingTileIds += tile.id
                 }
 
-                promoteResolvedTiles(state, tileMap, tile.id)
+                launch {
+                    try {
+                        val loaded = loadTile(
+                            state = state,
+                            tile = tile,
+                            tileIndex = index + 1,
+                            tileCount = nextTiles.size,
+                            token = token,
+                            updateViewBounds = false,
+                        )
+                        if (token != loadToken || !loaded || !state.isTileVisible(tile.id)) {
+                            return@launch
+                        }
+
+                        promoteResolvedTiles(state, tileMap, tile.id)
+                    } finally {
+                        loadingTileIds.remove(tile.id)
+                        visibleTileCount = state.visibleTileCount()
+                    }
+                }
             }
 
             if (shouldUseDetailMode(state, rootTiles)) {
@@ -614,155 +738,222 @@ fun ModelViewer(
     DisposableEffect(Unit) {
         onDispose {
             filamentState?.clearSceneAssets()
-            Log.d("ModelViewer", "ModelViewer disposed")
+            Log.d(TAG, "ModelViewer disposed")
         }
     }
 
-    AndroidView(
-        factory = { ctx ->
-            Gltfio.init()
-            Utils.init()
+    Box(modifier = modifier) {
+        AndroidView(
+            factory = { ctx ->
+                Gltfio.init()
+                Utils.init()
 
-            val engine = Engine.create()
-            val renderer = engine.createRenderer()
-            val scene = engine.createScene()
-            val view = engine.createView()
-            val camera = engine.createCamera(EntityManager.get().create())
+                val engine = Engine.create()
+                val renderer = engine.createRenderer()
+                val scene = engine.createScene()
+                val view = engine.createView()
+                val camera = engine.createCamera(EntityManager.get().create())
 
-            view.scene = scene
-            view.camera = camera
+                view.scene = scene
+                view.camera = camera
 
-            try {
-                val iblBuffer = loadAssetAsByteBuffer(ctx, "qwantani_ibl.ktx")
-                val skyboxBuffer = loadAssetAsByteBuffer(ctx, "qwantani_skybox.ktx")
-                val iblBundle = KTX1Loader.createIndirectLight(engine, iblBuffer)
-                scene.indirectLight = iblBundle.indirectLight
-                scene.indirectLight?.intensity = 30000f
-                val skyboxBundle = KTX1Loader.createSkybox(engine, skyboxBuffer)
-                scene.skybox = skyboxBundle.skybox
-            } catch (e: Exception) {
-                Log.e("ModelViewer", "Failed to load IBL/Skybox, using fallback", e)
-                scene.skybox = Skybox.Builder().color(0.53f, 0.81f, 0.92f, 1f).build(engine)
-            }
+                try {
+                    val iblBuffer = loadAssetAsByteBuffer(ctx, "qwantani_ibl.ktx")
+                    val skyboxBuffer = loadAssetAsByteBuffer(ctx, "qwantani_skybox.ktx")
+                    val iblBundle = KTX1Loader.createIndirectLight(engine, iblBuffer)
+                    scene.indirectLight = iblBundle.indirectLight
+                    scene.indirectLight?.intensity = 30000f
+                    val skyboxBundle = KTX1Loader.createSkybox(engine, skyboxBuffer)
+                    scene.skybox = skyboxBundle.skybox
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to load IBL/Skybox, using fallback", e)
+                    scene.skybox = Skybox.Builder().color(0.53f, 0.81f, 0.92f, 1f).build(engine)
+                }
 
-            val materialProvider = UbershaderProvider(engine)
-            val assetLoader = AssetLoader(engine, materialProvider, EntityManager.get())
-            val resourceLoader = ResourceLoader(engine)
-            val state = FilamentState(engine, renderer, scene, view, camera, assetLoader, resourceLoader)
-            filamentState = state
+                val materialProvider = UbershaderProvider(engine)
+                val assetLoader = AssetLoader(engine, materialProvider, EntityManager.get())
+                val resourceLoader = ResourceLoader(engine)
+                val state = FilamentState(engine, renderer, scene, view, camera, assetLoader, resourceLoader)
+                filamentState = state
 
-            var lastTouchX = 0f
-            var lastTouchY = 0f
-            var lastPinchDistance = 0f
-            var isPinching = false
+                var lastTouchX = 0f
+                var lastTouchY = 0f
+                var lastPinchDistance = 0f
+                var lastFocusX = 0f
+                var lastFocusY = 0f
+                var activePointerId = MotionEvent.INVALID_POINTER_ID
+                var isPinching = false
 
-            fun getPinchDistance(event: MotionEvent): Float {
-                if (event.pointerCount < 2) return 0f
-                val dx = event.getX(0) - event.getX(1)
-                val dy = event.getY(0) - event.getY(1)
-                return sqrt(dx * dx + dy * dy)
-            }
+                fun getPinchDistance(event: MotionEvent): Float {
+                    if (event.pointerCount < 2) return 0f
+                    val dx = event.getX(0) - event.getX(1)
+                    val dy = event.getY(0) - event.getY(1)
+                    return sqrt(dx * dx + dy * dy)
+                }
 
-            val surfaceView = SurfaceView(ctx)
-            val uiHelper = UiHelper(UiHelper.ContextErrorPolicy.DONT_CHECK)
-            val displayHelper = DisplayHelper(ctx)
-            var swapChain: SwapChain? = null
+                fun getFocusPoint(event: MotionEvent): Pair<Float, Float> {
+                    if (event.pointerCount < 2) return event.x to event.y
+                    val focusX = (event.getX(0) + event.getX(1)) / 2f
+                    val focusY = (event.getY(0) + event.getY(1)) / 2f
+                    return focusX to focusY
+                }
 
-            surfaceView.setOnTouchListener { viewRef, event ->
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        lastTouchX = event.x
-                        lastTouchY = event.y
-                        isPinching = false
-                        true
-                    }
-                    MotionEvent.ACTION_POINTER_DOWN -> {
-                        if (event.pointerCount == 2) {
-                            lastPinchDistance = getPinchDistance(event)
-                            isPinching = true
+                val surfaceView = SurfaceView(ctx)
+                val uiHelper = UiHelper(UiHelper.ContextErrorPolicy.DONT_CHECK)
+                val displayHelper = DisplayHelper(ctx)
+                var swapChain: SwapChain? = null
+
+                surfaceView.setOnTouchListener { viewRef, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            activePointerId = event.getPointerId(0)
+                            lastTouchX = event.x
+                            lastTouchY = event.y
+                            isPinching = false
+                            true
                         }
-                        true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        when (event.pointerCount) {
-                            2 -> {
-                                if (isPinching) {
+                        MotionEvent.ACTION_POINTER_DOWN -> {
+                            if (event.pointerCount >= 2) {
+                                val (focusX, focusY) = getFocusPoint(event)
+                                lastFocusX = focusX
+                                lastFocusY = focusY
+                                lastPinchDistance = getPinchDistance(event)
+                                isPinching = true
+                            }
+                            true
+                        }
+                        MotionEvent.ACTION_MOVE -> {
+                            when {
+                                event.pointerCount >= 2 -> {
                                     val currentDistance = getPinchDistance(event)
-                                    if (lastPinchDistance > 0 && currentDistance > 0) {
-                                        val scale = lastPinchDistance / currentDistance
-                                        state.cameraDistance = (state.cameraDistance * scale).coerceIn(1.0, 100.0)
+                                    val (focusX, focusY) = getFocusPoint(event)
+                                    if (!isPinching) {
                                         lastPinchDistance = currentDistance
+                                        lastFocusX = focusX
+                                        lastFocusY = focusY
+                                        isPinching = true
+                                    } else {
+                                        if (lastPinchDistance > 0f && currentDistance > 0f) {
+                                            state.zoomBy((lastPinchDistance / currentDistance).toDouble())
+                                        }
+                                        state.panBy(
+                                            deltaX = focusX - lastFocusX,
+                                            deltaY = focusY - lastFocusY,
+                                            viewportWidth = viewRef.width,
+                                            viewportHeight = viewRef.height,
+                                        )
+                                    }
+                                    lastPinchDistance = currentDistance
+                                    lastFocusX = focusX
+                                    lastFocusY = focusY
+                                }
+                                event.pointerCount == 1 -> {
+                                    val pointerIndex = event.findPointerIndex(activePointerId).takeIf { it >= 0 } ?: 0
+                                    val x = event.getX(pointerIndex)
+                                    val y = event.getY(pointerIndex)
+                                    val dx = x - lastTouchX
+                                    val dy = y - lastTouchY
+                                    state.cameraAngleX += dx * CAMERA_ROTATION_SENSITIVITY
+                                    state.cameraAngleY = (state.cameraAngleY - dy * CAMERA_ROTATION_SENSITIVITY)
+                                        .coerceIn(CAMERA_MIN_PITCH, CAMERA_MAX_PITCH)
+                                    lastTouchX = x
+                                    lastTouchY = y
+                                    isPinching = false
+                                }
+                            }
+                            state.updateCamera()
+                            true
+                        }
+                        MotionEvent.ACTION_POINTER_UP -> {
+                            if (event.pointerCount - 1 < 2) {
+                                isPinching = false
+                                lastPinchDistance = 0f
+                                val remainingIndex = if (event.actionIndex == 0) 1 else 0
+                                if (remainingIndex in 0 until event.pointerCount) {
+                                    activePointerId = event.getPointerId(remainingIndex)
+                                    lastTouchX = event.getX(remainingIndex)
+                                    lastTouchY = event.getY(remainingIndex)
+                                } else {
+                                    activePointerId = MotionEvent.INVALID_POINTER_ID
+                                }
+                            } else {
+                                isPinching = false
+                                lastPinchDistance = 0f
+                            }
+                            true
+                        }
+                        MotionEvent.ACTION_UP -> {
+                            activePointerId = MotionEvent.INVALID_POINTER_ID
+                            isPinching = false
+                            lastPinchDistance = 0f
+                            viewRef.performClick()
+                            true
+                        }
+                        MotionEvent.ACTION_CANCEL -> {
+                            activePointerId = MotionEvent.INVALID_POINTER_ID
+                            isPinching = false
+                            lastPinchDistance = 0f
+                            false
+                        }
+                        else -> false
+                    }
+                }
+
+                uiHelper.renderCallback = object : UiHelper.RendererCallback {
+                    override fun onNativeWindowChanged(surface: Surface) {
+                        swapChain?.let { engine.destroySwapChain(it) }
+                        swapChain = engine.createSwapChain(surface)
+                        displayHelper.attach(renderer, surfaceView.display)
+                        state.updateCamera()
+
+                        val frameCallback = object : Choreographer.FrameCallback {
+                            override fun doFrame(frameTimeNanos: Long) {
+                                if (surfaceView.height > 0) {
+                                    val aspect = surfaceView.width.toDouble() / surfaceView.height
+                                    camera.setProjection(45.0, aspect, 0.1, 500.0, Camera.Fov.VERTICAL)
+                                }
+
+                                swapChain?.let { chain ->
+                                    if (renderer.beginFrame(chain, frameTimeNanos)) {
+                                        renderer.render(view)
+                                        renderer.endFrame()
                                     }
                                 }
-                            }
-                            1 -> {
-                                if (!isPinching) {
-                                    val dx = event.x - lastTouchX
-                                    val dy = event.y - lastTouchY
-                                    state.cameraAngleX += dx * 0.3
-                                    state.cameraAngleY = (state.cameraAngleY - dy * 0.3).coerceIn(-89.0, 89.0)
-                                    lastTouchX = event.x
-                                    lastTouchY = event.y
-                                }
+
+                                Choreographer.getInstance().postFrameCallback(this)
                             }
                         }
-                        state.updateCamera()
-                        true
+
+                        Choreographer.getInstance().postFrameCallback(frameCallback)
                     }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
-                        isPinching = false
-                        lastPinchDistance = 0f
-                        if (event.pointerCount == 1) {
-                            viewRef.performClick()
-                        }
-                        true
+
+                    override fun onDetachedFromSurface() {
+                        displayHelper.detach()
+                        swapChain?.let { engine.destroySwapChain(it) }
+                        swapChain = null
                     }
-                    else -> false
+
+                    override fun onResized(width: Int, height: Int) {
+                        view.viewport = Viewport(0, 0, width, height)
+                    }
                 }
+
+                uiHelper.attachTo(surfaceView)
+                surfaceView
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        ComposeSurface(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(12.dp),
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Text("Tiles: $visibleTileCount viditelných / ${loadingTileIds.size} loading")
+                Text(tileStatusMessage)
+                Text("Gesta: 1 prst orbit, 2 prsty pan + zoom")
             }
-
-            uiHelper.renderCallback = object : UiHelper.RendererCallback {
-                override fun onNativeWindowChanged(surface: Surface) {
-                    swapChain?.let { engine.destroySwapChain(it) }
-                    swapChain = engine.createSwapChain(surface)
-                    displayHelper.attach(renderer, surfaceView.display)
-                    state.updateCamera()
-
-                    val frameCallback = object : Choreographer.FrameCallback {
-                        override fun doFrame(frameTimeNanos: Long) {
-                            if (surfaceView.height > 0) {
-                                val aspect = surfaceView.width.toDouble() / surfaceView.height
-                                camera.setProjection(45.0, aspect, 0.1, 500.0, Camera.Fov.VERTICAL)
-                            }
-
-                            swapChain?.let { chain ->
-                                if (renderer.beginFrame(chain, frameTimeNanos)) {
-                                    renderer.render(view)
-                                    renderer.endFrame()
-                                }
-                            }
-
-                            Choreographer.getInstance().postFrameCallback(this)
-                        }
-                    }
-
-                    Choreographer.getInstance().postFrameCallback(frameCallback)
-                }
-
-                override fun onDetachedFromSurface() {
-                    displayHelper.detach()
-                    swapChain?.let { engine.destroySwapChain(it) }
-                    swapChain = null
-                }
-
-                override fun onResized(width: Int, height: Int) {
-                    view.viewport = Viewport(0, 0, width, height)
-                }
-            }
-
-            uiHelper.attachTo(surfaceView)
-            surfaceView
-        },
-        modifier = modifier
-    )
+        }
+    }
 }

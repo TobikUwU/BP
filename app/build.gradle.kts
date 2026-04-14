@@ -13,7 +13,7 @@ val localProperties = Properties().apply {
     }
 }
 
-val defaultServerBaseUrl = "https://192.168.50.96:3443"
+val defaultServerBaseUrl = "https://192.168.0.45:3443"
 val serverBaseUrl = (
     firstNonBlank(
         providers.gradleProperty("serverBaseUrl").orNull,
@@ -95,7 +95,7 @@ dependencies {
 
     // JSON serialization pro persistence
     implementation("com.google.code.gson:gson:2.10.1")
-    
+
     // OkHttp pro HTTP/2 support
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
