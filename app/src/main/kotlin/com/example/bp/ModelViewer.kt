@@ -115,7 +115,7 @@ private class FilamentState(
     var cameraAngleY = 20.0
     private var modelExtent = 1.0
 
-    private fun minimumCameraDistance(): Double = (modelExtent * 1.4).coerceAtLeast(0.75)
+    private fun minimumCameraDistance(): Double = (modelExtent * 0.35).coerceAtLeast(0.25)
 
     private fun maximumCameraDistance(): Double = (modelExtent * 10.0).coerceAtLeast(minimumCameraDistance() + 4.0)
 
@@ -363,6 +363,12 @@ fun ModelViewer(
             }
             manifest.tiles.filter { it.parentId == null }.forEach { tile ->
                 if (!contains(tile.id)) add(tile.id)
+            }
+            if (isEmpty()) {
+                val minimumDepth = manifest.tiles.minOfOrNull(StreamTile::depth) ?: 0
+                manifest.tiles.filter { it.depth == minimumDepth }.forEach { tile ->
+                    if (!contains(tile.id)) add(tile.id)
+                }
             }
         }
 
@@ -641,6 +647,15 @@ fun ModelViewer(
         loadingTileIds.clear()
         visibleTileCount = 0
         updateTileStatus("Připravuji stream pro ${session.model.name}")
+        Log.d(
+            TAG,
+            "Manifest for ${session.model.name}: ${session.bootstrap.manifest.tiles.size} tiles, " +
+                "${rootTiles.size} root, ${refinementTiles.size} refinement",
+        )
+        if (session.bootstrap.manifest.tiles.isNotEmpty() && rootTiles.isEmpty()) {
+            updateTileStatus("Manifest obsahuje tiles, ale nenašel jsem root tiles")
+            Log.w(TAG, "Manifest has ${session.bootstrap.manifest.tiles.size} tiles but no root tiles")
+        }
 
         if (entryStage != null) {
             updateTileStatus("Načítám vstupní overview stage ${entryStage.id}")
@@ -693,6 +708,8 @@ fun ModelViewer(
             if (nextTiles.isEmpty()) {
                 if (loadingTileIds.isNotEmpty()) {
                     updateTileStatus("Čekám na ${loadingTileIds.size} rozpracované detail tiles")
+                } else if (session.bootstrap.manifest.tiles.isNotEmpty() && state.visibleTileCount() == 0) {
+                    updateTileStatus("Detail tiles zatím nemají kandidáta ke stažení")
                 }
                 delay(250)
                 continue
@@ -802,6 +819,8 @@ fun ModelViewer(
                 val uiHelper = UiHelper(UiHelper.ContextErrorPolicy.DONT_CHECK)
                 val displayHelper = DisplayHelper(ctx)
                 var swapChain: SwapChain? = null
+                var isRenderLoopActive = false
+                var frameCallback: Choreographer.FrameCallback? = null
 
                 surfaceView.setOnTouchListener { viewRef, event ->
                     when (event.actionMasked) {
@@ -905,9 +924,12 @@ fun ModelViewer(
                         swapChain = engine.createSwapChain(surface)
                         displayHelper.attach(renderer, surfaceView.display)
                         state.updateCamera()
+                        isRenderLoopActive = true
+                        frameCallback?.let(Choreographer.getInstance()::removeFrameCallback)
 
-                        val frameCallback = object : Choreographer.FrameCallback {
+                        val callback = object : Choreographer.FrameCallback {
                             override fun doFrame(frameTimeNanos: Long) {
+                                if (!isRenderLoopActive) return
                                 if (surfaceView.height > 0) {
                                     val aspect = surfaceView.width.toDouble() / surfaceView.height
                                     camera.setProjection(45.0, aspect, 0.1, 500.0, Camera.Fov.VERTICAL)
@@ -920,14 +942,19 @@ fun ModelViewer(
                                     }
                                 }
 
-                                Choreographer.getInstance().postFrameCallback(this)
+                                if (isRenderLoopActive) {
+                                    Choreographer.getInstance().postFrameCallback(this)
+                                }
                             }
                         }
-
-                        Choreographer.getInstance().postFrameCallback(frameCallback)
+                        frameCallback = callback
+                        Choreographer.getInstance().postFrameCallback(callback)
                     }
 
                     override fun onDetachedFromSurface() {
+                        isRenderLoopActive = false
+                        frameCallback?.let(Choreographer.getInstance()::removeFrameCallback)
+                        frameCallback = null
                         displayHelper.detach()
                         swapChain?.let { engine.destroySwapChain(it) }
                         swapChain = null

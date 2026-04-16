@@ -119,10 +119,11 @@ class ModelDownloader(private val context: Context) {
             val cacheDir = getModelCacheDir(modelInfo.name)
             cacheDir.mkdirs()
             markModelAccessed(modelInfo.name)
+            val resolvedModelInfo = mergeModelInfo(modelInfo, bootstrap)
 
             val entryStage = resolveEntryStage(bootstrap) ?: return@withContext null
             val entryFile = ensureAssetCached(
-                modelInfo = modelInfo,
+                modelInfo = resolvedModelInfo,
                 assetId = entryStage.id,
                 relativePath = entryStage.file,
                 assetUrl = entryStage.url,
@@ -137,7 +138,7 @@ class ModelDownloader(private val context: Context) {
             enforceCacheBudget(preserveModelName = modelInfo.name)
 
             StreamSession(
-                model = modelInfo,
+                model = resolvedModelInfo,
                 bootstrap = bootstrap,
                 cacheDirPath = cacheDir.absolutePath,
                 entryFilePath = entryFile.absolutePath
@@ -210,7 +211,7 @@ class ModelDownloader(private val context: Context) {
         markModelAccessed(modelInfo.name)
 
         return StreamSession(
-            model = modelInfo,
+            model = mergeModelInfo(modelInfo, bootstrap),
             bootstrap = bootstrap,
             cacheDirPath = cacheDir.absolutePath,
             entryFilePath = entryFile.absolutePath
@@ -451,6 +452,31 @@ class ModelDownloader(private val context: Context) {
             ?: bootstrap.metadata.overviewStages.lastOrNull()
     }
 
+    private fun mergeModelInfo(modelInfo: ModelInfo, bootstrap: StreamBootstrap): ModelInfo {
+        val metadata = bootstrap.metadata
+        val manifest = bootstrap.manifest
+
+        return modelInfo.copy(
+            name = metadata.modelName.ifBlank { modelInfo.name },
+            entryFile = metadata.entryFile.ifBlank { modelInfo.entryFile },
+            entryUrl = metadata.entryUrl.ifBlank { modelInfo.entryUrl },
+            assetDirectory = metadata.assetDirectory.ifBlank { modelInfo.assetDirectory },
+            manifestUrl = metadata.manifestUrl.ifBlank { modelInfo.manifestUrl },
+            bootstrapUrl = metadata.bootstrapUrl.ifBlank { modelInfo.bootstrapUrl },
+            streamingStrategy = metadata.streamingStrategy.ifBlank { modelInfo.streamingStrategy },
+            upgradeOrder = manifest.upgradeOrder.ifEmpty {
+                metadata.upgradeOrder.ifEmpty { modelInfo.upgradeOrder }
+            },
+            overviewStageCount = manifest.overviewStages.size.takeIf { it > 0 }
+                ?: modelInfo.overviewStageCount,
+            tileCount = manifest.tileCount.takeIf { it > 0 } ?: modelInfo.tileCount,
+            type = metadata.type.ifBlank { modelInfo.type },
+            size = metadata.size.takeIf { it > 0 } ?: modelInfo.size,
+            sizeInMB = metadata.sizeInMB.takeIf { it > 0.0 } ?: modelInfo.sizeInMB,
+            created = metadata.created.ifBlank { modelInfo.created },
+        )
+    }
+
     private suspend fun ensureAssetCached(
         modelInfo: ModelInfo,
         assetId: String,
@@ -471,13 +497,12 @@ class ModelDownloader(private val context: Context) {
         outputFile.parentFile?.mkdirs()
 
         try {
-            val resolvedUrl = assetUrl.ifBlank {
-                if (relativePath.isNotBlank() && modelInfo.assetDirectory.isNotBlank()) {
-                    "${modelInfo.assetDirectory.trimEnd('/')}/${relativePath.replace('\\', '/')}"
-                } else {
-                    modelInfo.entryUrl
-                }
-            }
+            val resolvedUrl = resolveAssetUrl(
+                modelInfo = modelInfo,
+                assetUrl = assetUrl,
+                relativePath = relativePath,
+            )
+            Log.d(TAG, "Caching asset $assetId from $resolvedUrl")
 
             val totalBytes = assetSize.coerceAtLeast(1L)
             var downloadedBytes = 0L
@@ -786,6 +811,66 @@ class ModelDownloader(private val context: Context) {
 
     private fun normalizeServerPath(path: String): String {
         return path.replace('\\', '/')
+    }
+
+    private fun resolveAssetUrl(
+        modelInfo: ModelInfo,
+        assetUrl: String,
+        relativePath: String,
+    ): String {
+        val normalizedAssetUrl = normalizeServerPath(assetUrl).trim()
+        val normalizedRelativePath = normalizeServerPath(relativePath).trim().trimStart('/')
+        val assetDirectory = normalizeServerPath(modelInfo.assetDirectory).trim()
+        val entryDirectory = directoryUrlOrPath(modelInfo.entryUrl)
+
+        return when {
+            normalizedAssetUrl.startsWith("http://") || normalizedAssetUrl.startsWith("https://") -> {
+                normalizedAssetUrl
+            }
+            normalizedAssetUrl.startsWith("/") -> {
+                absoluteUrl(normalizedAssetUrl)
+            }
+            normalizedAssetUrl.isNotBlank() && assetDirectory.isNotBlank() -> {
+                absoluteUrl(joinServerPaths(assetDirectory, normalizedAssetUrl))
+            }
+            normalizedAssetUrl.isNotBlank() && entryDirectory.isNotBlank() -> {
+                absoluteUrl(joinServerPaths(entryDirectory, normalizedAssetUrl))
+            }
+            normalizedAssetUrl.isNotBlank() -> {
+                absoluteUrl(normalizedAssetUrl)
+            }
+            normalizedRelativePath.isNotBlank() && assetDirectory.isNotBlank() -> {
+                absoluteUrl(joinServerPaths(assetDirectory, normalizedRelativePath))
+            }
+            normalizedRelativePath.isNotBlank() && entryDirectory.isNotBlank() -> {
+                absoluteUrl(joinServerPaths(entryDirectory, normalizedRelativePath))
+            }
+            else -> {
+                absoluteUrl(modelInfo.entryUrl)
+            }
+        }
+    }
+
+    private fun directoryUrlOrPath(location: String): String {
+        val normalized = normalizeServerPath(location).trim()
+        if (normalized.isBlank()) return ""
+        if (normalized.endsWith("/")) return normalized.trimEnd('/')
+        val separatorIndex = normalized.lastIndexOf('/')
+        return if (separatorIndex >= 0) {
+            normalized.substring(0, separatorIndex)
+        } else {
+            ""
+        }
+    }
+
+    private fun joinServerPaths(base: String, child: String): String {
+        val normalizedBase = normalizeServerPath(base).trim().trimEnd('/')
+        val normalizedChild = normalizeServerPath(child).trim().trimStart('/')
+        return when {
+            normalizedBase.isBlank() -> normalizedChild
+            normalizedChild.isBlank() -> normalizedBase
+            else -> "$normalizedBase/$normalizedChild"
+        }
     }
 
     private fun absoluteUrl(path: String): String {
