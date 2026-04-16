@@ -307,6 +307,9 @@ fun ModelViewer(
     var loadToken by remember { mutableIntStateOf(0) }
     val loadingTileIds = remember(session.model.name) { mutableStateListOf<String>() }
     var visibleTileCount by remember(session.model.name) { mutableIntStateOf(0) }
+    var overviewStatusMessage by remember(session.model.name) {
+        mutableStateOf("Overview: čekám")
+    }
     var tileStatusMessage by remember(session.model.name) {
         mutableStateOf("Čekám na detailní tiles")
     }
@@ -315,6 +318,70 @@ fun ModelViewer(
         if (tileStatusMessage == message) return
         tileStatusMessage = message
         Log.d(TAG, message)
+    }
+
+    fun updateOverviewStatus(message: String) {
+        if (overviewStatusMessage == message) return
+        overviewStatusMessage = message
+        Log.d(TAG, message)
+    }
+
+    fun overviewStageLabel(stages: List<StreamStage>, index: Int): String {
+        if (index !in stages.indices) return "žádná"
+        val stage = stages[index]
+        return "${stage.id} (${index + 1}/${stages.size})"
+    }
+
+    fun overviewSnapshot(
+        state: FilamentState,
+        stages: List<StreamStage>,
+        currentIndex: Int,
+        desiredIndex: Int,
+    ): String {
+        val zoomPercent = (state.zoomFactor() * 100).toInt()
+        return "Overview current=${overviewStageLabel(stages, currentIndex)} desired=${overviewStageLabel(stages, desiredIndex)} zoom=${zoomPercent}%"
+    }
+
+    fun detailCandidateSnapshot(
+        state: FilamentState,
+        currentSession: StreamSession,
+        rootTiles: List<StreamTile>,
+        refinementTiles: List<StreamTile>,
+        activeTileIds: Set<String>,
+    ): String {
+        val budgets = currentSession.bootstrap.manifest.clientBudgets
+        val maxActiveTiles = budgets.recommendedMaxActiveTiles
+            .coerceAtLeast(4)
+            .coerceAtMost(8)
+        val rootTileCount = rootTiles.size
+        val zoomPercent = (state.zoomFactor() * 100).toInt()
+        val visibleTiles = state.visibleTileCount() + activeTileIds.size
+        val minimumVisible = minOf(rootTileCount, (maxActiveTiles / 2).coerceAtLeast(4))
+        val targetVisible = (minimumVisible + ((maxActiveTiles - minimumVisible) * state.zoomFactor()))
+            .toInt()
+            .coerceAtLeast(minimumVisible)
+            .coerceAtMost(maxActiveTiles)
+        val loadBudget = (targetVisible - visibleTiles).coerceAtLeast(0)
+        val requestSlots = (budgets.recommendedConcurrentTileRequests.coerceIn(1, 2) - activeTileIds.size)
+            .coerceAtLeast(0)
+        val candidates = rootTiles + refinementTiles
+        val readyCandidates = candidates.count { tile ->
+            val parentId = tile.parentId
+            !state.isTileResolved(tile.id) &&
+                tile.id !in activeTileIds &&
+                (parentId == null || state.isTileResolved(parentId) || state.isTileVisible(parentId))
+        }
+        val blockedByParent = candidates.count { tile ->
+            val parentId = tile.parentId
+            !state.isTileResolved(tile.id) &&
+                tile.id !in activeTileIds &&
+                parentId != null &&
+                !state.isTileResolved(parentId) &&
+                !state.isTileVisible(parentId)
+        }
+        val unresolved = candidates.count { !state.isTileResolved(it.id) }
+
+        return "Detail kandidáti=0 zoom=${zoomPercent}% visible=${state.visibleTileCount()} active=${activeTileIds.size} target=$targetVisible/$maxActiveTiles loadBudget=$loadBudget slots=$requestSlots roots=${rootTiles.size} refinement=${refinementTiles.size} ready=$readyCandidates blockedParent=$blockedByParent unresolved=$unresolved"
     }
 
     fun overviewSequence(currentSession: StreamSession): List<StreamStage> {
@@ -548,6 +615,8 @@ fun ModelViewer(
     suspend fun loadStage(state: FilamentState, stage: StreamStage, token: Int) {
         val sequence = overviewSequence(session)
         val stageIndex = sequence.indexOfFirst { it.id == stage.id }.coerceAtLeast(0) + 1
+        val zoomPercent = (state.zoomFactor() * 100).toInt()
+        updateOverviewStatus("Overview loading ${stage.id} ($stageIndex/${sequence.size}) zoom=${zoomPercent}%")
         updateTileStatus("Načítám overview stage ${stage.id}")
         val stageFile = downloader.ensureOverviewStageCached(
             session = session,
@@ -566,6 +635,7 @@ fun ModelViewer(
 
         state.setOverviewAsset(asset, updateViewBounds = false)
         updateTileStatus("Overview stage ${stage.id} připravena")
+        updateOverviewStatus("Overview ready ${stage.id} ($stageIndex/${sequence.size}) zoom=${zoomPercent}%")
     }
 
     fun promoteResolvedTiles(
@@ -646,18 +716,28 @@ fun ModelViewer(
         state.clearSceneAssets()
         loadingTileIds.clear()
         visibleTileCount = 0
+        overviewStatusMessage = "Overview: inicializace"
         updateTileStatus("Připravuji stream pro ${session.model.name}")
         Log.d(
             TAG,
             "Manifest for ${session.model.name}: ${session.bootstrap.manifest.tiles.size} tiles, " +
                 "${rootTiles.size} root, ${refinementTiles.size} refinement",
         )
+        if (overviewStages.isEmpty()) {
+            updateOverviewStatus("Overview: manifest bez stages")
+        } else {
+            Log.d(
+                TAG,
+                "Overview sequence for ${session.model.name}: ${overviewStages.joinToString(" -> ") { it.id }}, entry=${entryStage?.id ?: "žádná"}",
+            )
+        }
         if (session.bootstrap.manifest.tiles.isNotEmpty() && rootTiles.isEmpty()) {
             updateTileStatus("Manifest obsahuje tiles, ale nenašel jsem root tiles")
             Log.w(TAG, "Manifest has ${session.bootstrap.manifest.tiles.size} tiles but no root tiles")
         }
 
         if (entryStage != null) {
+            updateOverviewStatus("Overview entry loading ${overviewStageLabel(overviewStages, currentOverviewIndex)}")
             updateTileStatus("Načítám vstupní overview stage ${entryStage.id}")
             val stageFile = downloader.ensureOverviewStageCached(
                 session = session,
@@ -674,6 +754,14 @@ fun ModelViewer(
             state.setOverviewAsset(asset, updateViewBounds = true)
             if (token != loadToken) return@LaunchedEffect
             updateTileStatus("Vstupní overview stage ${entryStage.id} připravena")
+            updateOverviewStatus(
+                overviewSnapshot(
+                    state = state,
+                    stages = overviewStages,
+                    currentIndex = currentOverviewIndex,
+                    desiredIndex = desiredOverviewStageIndex(state, overviewStages),
+                ),
+            )
             if (!firstVisualDelivered) {
                 onModelLoaded?.invoke()
                 firstVisualDelivered = true
@@ -684,9 +772,22 @@ fun ModelViewer(
             val desiredOverviewIndex = desiredOverviewStageIndex(state, overviewStages)
             if (currentOverviewIndex in 0 until desiredOverviewIndex) {
                 val nextIndex = currentOverviewIndex + 1
+                updateOverviewStatus(
+                    "Overview upgrade ${overviewStageLabel(overviewStages, currentOverviewIndex)} -> ${overviewStageLabel(overviewStages, nextIndex)} target=${overviewStageLabel(overviewStages, desiredOverviewIndex)}",
+                )
                 loadStage(state, overviewStages[nextIndex], token)
                 if (token != loadToken) return@LaunchedEffect
                 currentOverviewIndex = nextIndex
+            }
+            if (overviewStages.isNotEmpty()) {
+                updateOverviewStatus(
+                    overviewSnapshot(
+                        state = state,
+                        stages = overviewStages,
+                        currentIndex = currentOverviewIndex,
+                        desiredIndex = desiredOverviewIndex,
+                    ),
+                )
             }
 
             pruneVisibleTiles(
@@ -708,12 +809,25 @@ fun ModelViewer(
             if (nextTiles.isEmpty()) {
                 if (loadingTileIds.isNotEmpty()) {
                     updateTileStatus("Čekám na ${loadingTileIds.size} rozpracované detail tiles")
-                } else if (session.bootstrap.manifest.tiles.isNotEmpty() && state.visibleTileCount() == 0) {
-                    updateTileStatus("Detail tiles zatím nemají kandidáta ke stažení")
+                } else if (session.bootstrap.manifest.tiles.isNotEmpty()) {
+                    updateTileStatus(
+                        detailCandidateSnapshot(
+                            state = state,
+                            currentSession = session,
+                            rootTiles = rootTiles,
+                            refinementTiles = refinementTiles,
+                            activeTileIds = loadingTileIds.toSet(),
+                        ),
+                    )
                 }
                 delay(250)
                 continue
             }
+
+            Log.d(
+                TAG,
+                "Selected ${nextTiles.size} detail candidates at zoom ${(state.zoomFactor() * 100).toInt()}%: ${nextTiles.joinToString { it.id }}",
+            )
 
             nextTiles.forEachIndexed { index, tile ->
                 if (tile.id !in loadingTileIds) {
@@ -978,6 +1092,7 @@ fun ModelViewer(
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 Text("Tiles: $visibleTileCount viditelných / ${loadingTileIds.size} loading")
+                Text(overviewStatusMessage)
                 Text(tileStatusMessage)
                 Text("Gesta: 1 prst orbit, 2 prsty pan + zoom")
             }

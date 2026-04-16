@@ -380,7 +380,7 @@ class ModelDownloader(private val context: Context) {
                 add(
                     StreamTile(
                         id = id,
-                        parentId = item.optString("parentId").ifBlank { null },
+                        parentId = normalizeOptionalId(item.opt("parentId")?.toString()),
                         name = item.optString("name"),
                         depth = item.optInt("depth", 0),
                         refinement = item.optString("refinement", "replace"),
@@ -401,6 +401,13 @@ class ModelDownloader(private val context: Context) {
                     )
                 )
             }
+        }
+    }
+
+    private fun normalizeOptionalId(value: String?): String? {
+        val normalized = value?.trim().orEmpty()
+        return normalized.takeUnless {
+            it.isEmpty() || it.equals("null", ignoreCase = true)
         }
     }
 
