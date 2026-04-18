@@ -68,6 +68,7 @@ fun ModelScreen() {
     var cacheSize by remember { mutableStateOf(0L) }
     var expanded by remember { mutableStateOf(false) }
     var downloadJob by remember { mutableStateOf<Job?>(null) }
+    val isSelectedModelOpen = selectedModel?.name != null && activeSession?.model?.name == selectedModel?.name
 
     fun formatBytes(bytes: Long): String {
         return when {
@@ -249,35 +250,43 @@ fun ModelScreen() {
 
                 Button(
                     onClick = {
-                        selectedModel?.let { model ->
+                        if (isSelectedModelOpen) {
                             downloadJob?.cancel()
-                            downloadJob = scope.launch {
-                                try {
-                                    errorMessage = null
-                                    val cached = downloadManager.getCachedSession(model)
-                                    if (cached != null) {
-                                        activeSession = cached
-                                        return@launch
-                                    }
+                            activeSession = null
+                            isViewerLoading = false
+                            downloadProgress = null
+                            errorMessage = null
+                        } else {
+                            selectedModel?.let { model ->
+                                downloadJob?.cancel()
+                                downloadJob = scope.launch {
+                                    try {
+                                        errorMessage = null
+                                        val cached = downloadManager.getCachedSession(model)
+                                        if (cached != null) {
+                                            activeSession = cached
+                                            return@launch
+                                        }
 
-                                    isLoading = true
-                                    downloadProgress = null
-                                    val session = downloadManager.downloadModelSmart(model) { progress ->
-                                        downloadProgress = progress
-                                    }
+                                        isLoading = true
+                                        downloadProgress = null
+                                        val session = downloadManager.downloadModelSmart(model) { progress ->
+                                            downloadProgress = progress
+                                        }
 
-                                    if (session != null) {
-                                        activeSession = session
-                                        cacheSize = downloadManager.getCacheSize()
-                                    } else {
-                                        errorMessage = "Načtení stream bootstrapu selhalo"
+                                        if (session != null) {
+                                            activeSession = session
+                                            cacheSize = downloadManager.getCacheSize()
+                                        } else {
+                                            errorMessage = "Načtení stream bootstrapu selhalo"
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.e("ModelScreen", "Download error", e)
+                                        errorMessage = "Chyba: ${e.message}"
+                                    } finally {
+                                        isLoading = false
+                                        downloadProgress = null
                                     }
-                                } catch (e: Exception) {
-                                    Log.e("ModelScreen", "Download error", e)
-                                    errorMessage = "Chyba: ${e.message}"
-                                } finally {
-                                    isLoading = false
-                                    downloadProgress = null
                                 }
                             }
                         }
@@ -290,10 +299,10 @@ fun ModelScreen() {
                         Spacer(modifier = Modifier.height(8.dp))
                     }
                     Text(
-                        if (selectedModel?.name?.let(downloadManager::isModelDownloaded) == true) {
-                            "Zobrazit stream model"
+                        if (isSelectedModelOpen) {
+                            "Zavřít model"
                         } else {
-                            "Načíst entry stage"
+                            "Otevřít model"
                         }
                     )
                 }

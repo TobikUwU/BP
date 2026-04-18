@@ -1,6 +1,7 @@
 package com.example.bp
 
 import android.annotation.SuppressLint
+import android.os.SystemClock
 import android.util.Log
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -17,6 +18,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,6 +52,8 @@ import com.google.android.filament.utils.Utils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -61,7 +65,8 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 private const val TAG = "ModelViewer"
-private const val TILE_LOAD_TIMEOUT_MS = 20_000L
+private const val MIN_TILE_LOAD_TIMEOUT_MS = 20_000L
+private const val MAX_TILE_LOAD_TIMEOUT_MS = 120_000L
 private const val CAMERA_ROTATION_SENSITIVITY = 0.25
 private const val CAMERA_MIN_PITCH = -80.0
 private const val CAMERA_MAX_PITCH = 80.0
@@ -101,7 +106,6 @@ private class FilamentState(
     val view: View,
     val camera: Camera,
     val assetLoader: AssetLoader,
-    val resourceLoader: ResourceLoader
 ) {
     private var overviewAsset: FilamentAsset? = null
     private var overviewVisible = false
@@ -305,8 +309,17 @@ fun ModelViewer(
     val downloader = remember(context) { ModelDownloader(context) }
     var filamentState by remember { mutableStateOf<FilamentState?>(null) }
     var loadToken by remember { mutableIntStateOf(0) }
-    val loadingTileIds = remember(session.model.name) { mutableStateListOf<String>() }
+    val downloadingTileIds = remember(session.model.name) { mutableStateListOf<String>() }
+    val pendingTileIds = remember(session.model.name) { mutableStateListOf<String>() }
+    val pendingTileFiles = remember(session.model.name) { linkedMapOf<String, File>() }
+    var activationTileId by remember(session.model.name) { mutableStateOf<String?>(null) }
     var visibleTileCount by remember(session.model.name) { mutableIntStateOf(0) }
+    var activeOverviewError by remember(session.model.name) { mutableStateOf<Double?>(null) }
+    var detailModeActive by remember(session.model.name) { mutableStateOf(false) }
+    var isTouchGestureActive by remember(session.model.name) { mutableStateOf(false) }
+    var lastUserInteractionAtMs by remember(session.model.name) { mutableLongStateOf(0L) }
+    var lastTileActivationAtMs by remember(session.model.name) { mutableLongStateOf(0L) }
+    val tileActivationMutex = remember(session.model.name) { Mutex() }
     var overviewStatusMessage by remember(session.model.name) {
         mutableStateOf("Overview: čekám")
     }
@@ -342,46 +355,72 @@ fun ModelViewer(
         return "Overview current=${overviewStageLabel(stages, currentIndex)} desired=${overviewStageLabel(stages, desiredIndex)} zoom=${zoomPercent}%"
     }
 
+    fun effectiveMaxActiveTiles(currentSession: StreamSession): Int {
+        return TileStreamingPolicy.effectiveMaxActiveTiles(
+            manifestTileCount = currentSession.bootstrap.manifest.tiles.size,
+            recommendedMaxActiveTiles = currentSession.bootstrap.manifest.clientBudgets.recommendedMaxActiveTiles,
+        )
+    }
+
+    fun detailStreamingIdleRemainingMs(): Long {
+        return TileStreamingPolicy.detailStreamingIdleRemainingMs(
+            isTouchGestureActive = isTouchGestureActive,
+            nowMs = SystemClock.uptimeMillis(),
+            lastUserInteractionAtMs = lastUserInteractionAtMs,
+        )
+    }
+
+    fun isDetailStreamingIdleReady(): Boolean =
+        TileStreamingPolicy.isDetailStreamingIdleReady(
+            isTouchGestureActive = isTouchGestureActive,
+            nowMs = SystemClock.uptimeMillis(),
+            lastUserInteractionAtMs = lastUserInteractionAtMs,
+        )
+
     fun detailCandidateSnapshot(
         state: FilamentState,
         currentSession: StreamSession,
         rootTiles: List<StreamTile>,
         refinementTiles: List<StreamTile>,
-        activeTileIds: Set<String>,
+        reservedTileIds: Set<String>,
+        downloadingIds: Set<String>,
     ): String {
         val budgets = currentSession.bootstrap.manifest.clientBudgets
-        val maxActiveTiles = budgets.recommendedMaxActiveTiles
-            .coerceAtLeast(4)
-            .coerceAtMost(8)
+        val maxActiveTiles = effectiveMaxActiveTiles(currentSession)
         val rootTileCount = rootTiles.size
         val zoomPercent = (state.zoomFactor() * 100).toInt()
-        val visibleTiles = state.visibleTileCount() + activeTileIds.size
-        val minimumVisible = minOf(rootTileCount, (maxActiveTiles / 2).coerceAtLeast(4))
-        val targetVisible = (minimumVisible + ((maxActiveTiles - minimumVisible) * state.zoomFactor()))
-            .toInt()
-            .coerceAtLeast(minimumVisible)
-            .coerceAtMost(maxActiveTiles)
+        val visibleTiles = state.visibleTileCount() + reservedTileIds.size
+        val targetVisible = TileStreamingPolicy.targetVisibleTileCount(
+            zoomFactor = state.zoomFactor(),
+            rootTileCount = rootTileCount,
+            maxActiveTiles = maxActiveTiles,
+        )
         val loadBudget = (targetVisible - visibleTiles).coerceAtLeast(0)
-        val requestSlots = (budgets.recommendedConcurrentTileRequests.coerceIn(1, 2) - activeTileIds.size)
+        val requestSlots = (budgets.recommendedConcurrentTileRequests.coerceIn(1, 2) - downloadingIds.size)
             .coerceAtLeast(0)
         val candidates = rootTiles + refinementTiles
         val readyCandidates = candidates.count { tile ->
             val parentId = tile.parentId
             !state.isTileResolved(tile.id) &&
-                tile.id !in activeTileIds &&
+                tile.id !in reservedTileIds &&
                 (parentId == null || state.isTileResolved(parentId) || state.isTileVisible(parentId))
         }
         val blockedByParent = candidates.count { tile ->
             val parentId = tile.parentId
             !state.isTileResolved(tile.id) &&
-                tile.id !in activeTileIds &&
+                tile.id !in reservedTileIds &&
                 parentId != null &&
                 !state.isTileResolved(parentId) &&
                 !state.isTileVisible(parentId)
         }
         val unresolved = candidates.count { !state.isTileResolved(it.id) }
+        val idleLabel = TileStreamingPolicy.detailIdleLabel(
+            isTouchGestureActive = isTouchGestureActive,
+            nowMs = SystemClock.uptimeMillis(),
+            lastUserInteractionAtMs = lastUserInteractionAtMs,
+        )
 
-        return "Detail kandidáti=0 zoom=${zoomPercent}% visible=${state.visibleTileCount()} active=${activeTileIds.size} target=$targetVisible/$maxActiveTiles loadBudget=$loadBudget slots=$requestSlots roots=${rootTiles.size} refinement=${refinementTiles.size} ready=$readyCandidates blockedParent=$blockedByParent unresolved=$unresolved"
+        return "Detail kandidáti=0 zoom=${zoomPercent}% visible=${state.visibleTileCount()} reserved=${reservedTileIds.size} downloading=${downloadingIds.size} target=$targetVisible/$maxActiveTiles loadBudget=$loadBudget slots=$requestSlots idle=$idleLabel roots=${rootTiles.size} refinement=${refinementTiles.size} ready=$readyCandidates blockedParent=$blockedByParent unresolved=$unresolved"
     }
 
     fun overviewSequence(currentSession: StreamSession): List<StreamStage> {
@@ -502,49 +541,25 @@ fun ModelViewer(
         currentSession: StreamSession,
         rootTiles: List<StreamTile>,
         refinementTiles: List<StreamTile>,
-        activeTileIds: Set<String>,
+        reservedTileIds: Set<String>,
+        downloadingIds: Set<String>,
     ): List<StreamTile> {
-        val budgets = currentSession.bootstrap.manifest.clientBudgets
-        val maxActiveTiles = budgets.recommendedMaxActiveTiles
-            .coerceAtLeast(4)
-            .coerceAtMost(8)
-        val rootTileCount = rootTiles.size
-        val visibleTiles = state.visibleTileCount() + activeTileIds.size
-        if (visibleTiles >= maxActiveTiles) return emptyList()
-
-        val zoomFactor = state.zoomFactor()
-        val minimumVisible = minOf(rootTileCount, (maxActiveTiles / 2).coerceAtLeast(4))
-        val targetVisible = (minimumVisible + ((maxActiveTiles - minimumVisible) * zoomFactor))
-            .toInt()
-            .coerceAtLeast(minimumVisible)
-            .coerceAtMost(maxActiveTiles)
-
-        val loadBudget = (targetVisible - visibleTiles).coerceAtLeast(0)
-        if (loadBudget == 0) return emptyList()
-
-        val maxConcurrent = budgets.recommendedConcurrentTileRequests.coerceIn(1, 2)
-        val availableRequestSlots = (maxConcurrent - activeTileIds.size).coerceAtLeast(0)
-        if (availableRequestSlots == 0) return emptyList()
-        val candidates = rootTiles + refinementTiles
-
-        return candidates
-            .asSequence()
-            .filter { !state.isTileResolved(it.id) }
-            .filter { it.id !in activeTileIds }
-            .filter { tile ->
-                val parentId = tile.parentId
-                parentId == null || state.isTileResolved(parentId) || state.isTileVisible(parentId)
-            }
-            .sortedWith(
-                compareBy<StreamTile>(
-                    { if (it.parentId == null) 0 else 1 },
-                    { tileDistanceScore(state, it) },
-                    { it.priority.takeIf { value -> value > 0 } ?: Int.MAX_VALUE },
-                    { it.depth },
-                ),
-            )
-            .take(loadBudget.coerceAtMost(availableRequestSlots))
-            .toList()
+        return TileStreamingPolicy.nextTilesToLoad(
+            zoomFactor = state.zoomFactor(),
+            visibleTileCount = state.visibleTileCount(),
+            manifestTileCount = currentSession.bootstrap.manifest.tiles.size,
+            recommendedMaxActiveTiles = currentSession.bootstrap.manifest.clientBudgets.recommendedMaxActiveTiles,
+            recommendedConcurrentTileRequests = currentSession.bootstrap.manifest.clientBudgets.recommendedConcurrentTileRequests,
+            rootTiles = rootTiles,
+            refinementTiles = refinementTiles,
+            reservedTileIds = reservedTileIds,
+            downloadingIds = downloadingIds,
+            lookup = object : TileStreamingPolicy.TileLookup {
+                override fun isResolved(tileId: String): Boolean = state.isTileResolved(tileId)
+                override fun isVisible(tileId: String): Boolean = state.isTileVisible(tileId)
+            },
+            distanceScore = { tile -> tileDistanceScore(state, tile) },
+        )
     }
 
     fun desiredOverviewStageIndex(state: FilamentState, overviewStages: List<StreamStage>): Int {
@@ -557,10 +572,20 @@ fun ModelViewer(
         }.coerceAtMost(overviewStages.lastIndex)
     }
 
-    fun shouldUseDetailMode(state: FilamentState, rootTiles: List<StreamTile>): Boolean {
-        if (rootTiles.isEmpty()) return false
-        val minimumDetailTiles = minOf(rootTiles.size, 4)
-        return state.zoomFactor() >= 0.55 && state.visibleTileCount() >= minimumDetailTiles
+    fun shouldUseDetailMode(
+        state: FilamentState,
+        tileMap: Map<String, StreamTile>,
+        currentOverviewStage: StreamStage?,
+        currentDetailMode: Boolean,
+    ): Boolean {
+        val visibleTiles = state.visibleTileIds()
+            .mapNotNull(tileMap::get)
+        return TileStreamingPolicy.shouldUseDetailMode(
+            zoomFactor = state.zoomFactor(),
+            visibleTiles = visibleTiles,
+            currentOverviewTriangleCount = currentOverviewStage?.triangleCount,
+            currentDetailMode = currentDetailMode,
+        )
     }
 
     fun pruneVisibleTiles(
@@ -569,18 +594,23 @@ fun ModelViewer(
         tileMap: Map<String, StreamTile>,
         rootTiles: List<StreamTile>,
     ) {
-        val maxActiveTiles = currentSession.bootstrap.manifest.clientBudgets.recommendedMaxActiveTiles
-            .coerceAtLeast(4)
-            .coerceAtMost(8)
+        if (currentSession.bootstrap.manifest.tiles.size <= TileStreamingPolicy.TILE_PRUNE_DISABLED_THRESHOLD) {
+            return
+        }
+
+        val maxActiveTiles = effectiveMaxActiveTiles(currentSession)
         val rootTileCount = rootTiles.size
-        val zoomFactor = state.zoomFactor()
-        val minimumVisible = minOf(rootTileCount, (maxActiveTiles / 2).coerceAtLeast(4))
-        val targetVisible = (minimumVisible + ((maxActiveTiles - minimumVisible) * zoomFactor))
-            .toInt()
-            .coerceAtLeast(minimumVisible)
+        val targetVisible = TileStreamingPolicy.targetVisibleTileCount(
+            zoomFactor = state.zoomFactor(),
+            rootTileCount = rootTileCount,
+            maxActiveTiles = maxActiveTiles,
+        )
+        val pruneThreshold = (targetVisible + TileStreamingPolicy.TILE_PRUNE_HYSTERESIS)
+            .coerceAtMost(maxActiveTiles)
+        val pruneTarget = (targetVisible + (TileStreamingPolicy.TILE_PRUNE_HYSTERESIS / 2))
             .coerceAtMost(maxActiveTiles)
 
-        if (state.visibleTileCount() <= targetVisible) return
+        if (state.visibleTileCount() <= pruneThreshold) return
 
         val removableTiles = state.visibleTileIds()
             .mapNotNull(tileMap::get)
@@ -593,13 +623,19 @@ fun ModelViewer(
             )
 
         removableTiles.forEach { tile ->
-            if (state.visibleTileCount() <= targetVisible) return
+            if (state.visibleTileCount() <= pruneTarget) return
             state.removeTile(tile.id)
             state.forgetTile(tile.id)
         }
     }
 
-    suspend fun createAsset(state: FilamentState, file: File, label: String): FilamentAsset? {
+    suspend fun createAsset(
+        state: FilamentState,
+        file: File,
+        label: String,
+        token: Int,
+        asyncResources: Boolean,
+    ): FilamentAsset? {
         val buffer = withContext(Dispatchers.IO) { loadFileAsByteBuffer(file) }
         val asset = state.assetLoader.createAsset(buffer)
         if (asset == null) {
@@ -607,7 +643,29 @@ fun ModelViewer(
             return null
         }
 
-        state.resourceLoader.loadResources(asset)
+        val resourceLoader = ResourceLoader(state.engine)
+        try {
+            if (asyncResources && resourceLoader.asyncBeginLoad(asset)) {
+                while (token == loadToken) {
+                    resourceLoader.asyncUpdateLoad()
+                    if (resourceLoader.asyncGetLoadProgress() >= 0.999f) {
+                        break
+                    }
+                    delay(8)
+                }
+
+                if (token != loadToken) {
+                    resourceLoader.asyncCancelLoad()
+                    state.assetLoader.destroyAsset(asset)
+                    return null
+                }
+            } else {
+                resourceLoader.loadResources(asset)
+            }
+        } finally {
+            resourceLoader.destroy()
+        }
+
         asset.releaseSourceData()
         return asset
     }
@@ -627,7 +685,13 @@ fun ModelViewer(
 
         if (token != loadToken) return
 
-        val asset = createAsset(state, stageFile, stage.id) ?: return
+        val asset = createAsset(
+            state = state,
+            file = stageFile,
+            label = stage.id,
+            token = token,
+            asyncResources = false,
+        ) ?: return
         if (token != loadToken) {
             state.assetLoader.destroyAsset(asset)
             return
@@ -658,17 +722,55 @@ fun ModelViewer(
         }
     }
 
-    suspend fun loadTile(
-        state: FilamentState,
+    fun tileSizeInMb(tile: StreamTile): String {
+        val sizeMb = tile.size.toDouble() / (1024.0 * 1024.0)
+        return "%.1f".format(sizeMb)
+    }
+
+    fun tileLoadTimeoutMs(tile: StreamTile): Long {
+        val sizeMb = (tile.size.toDouble() / (1024.0 * 1024.0)).coerceAtLeast(1.0)
+        return (15_000L + (sizeMb * 1_000.0).toLong())
+            .coerceIn(MIN_TILE_LOAD_TIMEOUT_MS, MAX_TILE_LOAD_TIMEOUT_MS)
+    }
+
+    suspend fun waitForTileActivationWindow(token: Int): Boolean {
+        while (token == loadToken) {
+            if (isTouchGestureActive) {
+                delay(16)
+                continue
+            }
+            val now = SystemClock.uptimeMillis()
+            val sinceInteraction = now - lastUserInteractionAtMs
+            val sinceActivation = now - lastTileActivationAtMs
+            val interactionRemaining = TileStreamingPolicy.TILE_ACTIVATION_IDLE_DELAY_MS - sinceInteraction
+            val activationRemaining = TileStreamingPolicy.TILE_ACTIVATION_SPACING_MS - sinceActivation
+            val waitMs = maxOf(interactionRemaining, activationRemaining)
+            if (waitMs <= 0L) {
+                return true
+            }
+            delay(waitMs.coerceAtMost(32L))
+        }
+        return false
+    }
+
+    fun shouldDisplayTile(tile: StreamTile): Boolean {
+        val overviewError = activeOverviewError ?: return true
+        return tile.error <= overviewError
+    }
+
+    suspend fun downloadTile(
         tile: StreamTile,
         tileIndex: Int,
         tileCount: Int,
         token: Int,
-        updateViewBounds: Boolean,
-    ): Boolean {
-        updateTileStatus("Načítám detail tile ${tile.id} ($tileIndex/$tileCount)")
+    ): File? {
+        val timeoutMs = tileLoadTimeoutMs(tile)
+        val tileSizeMb = tileSizeInMb(tile)
+        updateTileStatus(
+            "Načítám detail tile ${tile.id} ($tileIndex/$tileCount, ${tileSizeMb} MB, timeout ${timeoutMs / 1000}s)",
+        )
 
-        val tileFile = withTimeoutOrNull(TILE_LOAD_TIMEOUT_MS) {
+        val tileFile: File? = withTimeoutOrNull(timeoutMs) {
             downloader.ensureTileCached(
                 session = session,
                 tile = tile,
@@ -678,26 +780,66 @@ fun ModelViewer(
         }
 
         if (tileFile == null) {
-            updateTileStatus("Tile ${tile.id} timeout nebo chyba při downloadu")
-            Log.w(TAG, "Tile ${tile.id} failed or timed out after ${TILE_LOAD_TIMEOUT_MS}ms")
-            return false
+            updateTileStatus("Tile ${tile.id} timeout nebo chyba při downloadu (${tileSizeMb} MB)")
+            Log.w(TAG, "Tile ${tile.id} failed or timed out after ${timeoutMs}ms (${tileSizeMb} MB)")
+            return null
         }
 
+        if (token != loadToken) return null
+
+        return tileFile
+    }
+
+    suspend fun activateTile(
+        state: FilamentState,
+        tile: StreamTile,
+        tileFile: File,
+        token: Int,
+        updateViewBounds: Boolean,
+    ): Boolean {
         if (token != loadToken) return false
 
-        val asset = createAsset(state, tileFile, tile.id) ?: run {
-            updateTileStatus("Tile ${tile.id} se nepodařilo vytvořit")
-            return false
-        }
-        if (token != loadToken) {
-            state.assetLoader.destroyAsset(asset)
-            return false
-        }
+        return tileActivationMutex.withLock {
+            if (!waitForTileActivationWindow(token)) {
+                return@withLock false
+            }
 
-        state.registerTile(tile.id, asset, updateViewBounds)
-        visibleTileCount = state.visibleTileCount()
-        updateTileStatus("Detail tile ${tile.id} načtena, viditelných ${state.visibleTileCount()}")
-        return true
+            if (token != loadToken) {
+                return@withLock false
+            }
+
+            if (!shouldDisplayTile(tile)) {
+                state.markTileResolved(tile.id)
+                Log.d(
+                    TAG,
+                    "Tile ${tile.id} kept hidden because overview error ${activeOverviewError} is better than tile error ${tile.error}",
+                )
+                updateTileStatus("Tile ${tile.id} stažena jen pro odemčení child tiles, overview je kvalitnější")
+                lastTileActivationAtMs = SystemClock.uptimeMillis()
+                return@withLock true
+            }
+
+            val asset = createAsset(
+                state = state,
+                file = tileFile,
+                label = tile.id,
+                token = token,
+                asyncResources = true,
+            ) ?: run {
+                updateTileStatus("Tile ${tile.id} se nepodařilo vytvořit")
+                return@withLock false
+            }
+            if (token != loadToken) {
+                state.assetLoader.destroyAsset(asset)
+                return@withLock false
+            }
+
+            state.registerTile(tile.id, asset, updateViewBounds)
+            lastTileActivationAtMs = SystemClock.uptimeMillis()
+            visibleTileCount = state.visibleTileCount()
+            updateTileStatus("Detail tile ${tile.id} načtena, viditelných ${state.visibleTileCount()}")
+            return@withLock true
+        }
     }
 
     LaunchedEffect(session, filamentState) {
@@ -714,8 +856,16 @@ fun ModelViewer(
         var currentOverviewIndex = overviewStages.indexOfFirst { it.id == entryStage?.id }
 
         state.clearSceneAssets()
-        loadingTileIds.clear()
+        downloadingTileIds.clear()
+        pendingTileIds.clear()
+        pendingTileFiles.clear()
+        activationTileId = null
         visibleTileCount = 0
+        activeOverviewError = null
+        detailModeActive = false
+        isTouchGestureActive = false
+        lastUserInteractionAtMs = 0L
+        lastTileActivationAtMs = 0L
         overviewStatusMessage = "Overview: inicializace"
         updateTileStatus("Připravuji stream pro ${session.model.name}")
         Log.d(
@@ -746,13 +896,20 @@ fun ModelViewer(
                 stageCount = overviewStages.size.coerceAtLeast(1),
             ) ?: return@LaunchedEffect
             if (token != loadToken) return@LaunchedEffect
-            val asset = createAsset(state, stageFile, entryStage.id) ?: return@LaunchedEffect
+            val asset = createAsset(
+                state = state,
+                file = stageFile,
+                label = entryStage.id,
+                token = token,
+                asyncResources = false,
+            ) ?: return@LaunchedEffect
             if (token != loadToken) {
                 state.assetLoader.destroyAsset(asset)
                 return@LaunchedEffect
             }
             state.setOverviewAsset(asset, updateViewBounds = true)
             if (token != loadToken) return@LaunchedEffect
+            activeOverviewError = entryStage.error
             updateTileStatus("Vstupní overview stage ${entryStage.id} připravena")
             updateOverviewStatus(
                 overviewSnapshot(
@@ -778,6 +935,7 @@ fun ModelViewer(
                 loadStage(state, overviewStages[nextIndex], token)
                 if (token != loadToken) return@LaunchedEffect
                 currentOverviewIndex = nextIndex
+                activeOverviewError = overviewStages[nextIndex].error
             }
             if (overviewStages.isNotEmpty()) {
                 updateOverviewStatus(
@@ -798,17 +956,66 @@ fun ModelViewer(
             )
             visibleTileCount = state.visibleTileCount()
 
+            if (activationTileId == null && pendingTileIds.isNotEmpty() && isDetailStreamingIdleReady()) {
+                val nextPendingId = pendingTileIds.first()
+                val pendingTile = tileMap[nextPendingId]
+                val pendingFile = pendingTileFiles[nextPendingId]
+                if (pendingTile == null || pendingFile == null) {
+                    pendingTileFiles.remove(nextPendingId)
+                    pendingTileIds.remove(nextPendingId)
+                } else {
+                    activationTileId = nextPendingId
+                    launch {
+                        try {
+                            val activated = activateTile(
+                                state = state,
+                                tile = pendingTile,
+                                tileFile = pendingFile,
+                                token = token,
+                                updateViewBounds = false,
+                            )
+                            if (token != loadToken || !activated) {
+                                return@launch
+                            }
+
+                            promoteResolvedTiles(state, tileMap, pendingTile.id)
+                        } finally {
+                            pendingTileFiles.remove(nextPendingId)
+                            pendingTileIds.remove(nextPendingId)
+                            activationTileId = null
+                            visibleTileCount = state.visibleTileCount()
+                        }
+                    }
+                }
+            }
+
+            val reservedTileIds = buildSet {
+                addAll(downloadingTileIds)
+                addAll(pendingTileIds)
+                activationTileId?.let(::add)
+            }
+
             val nextTiles = nextTilesToLoad(
                 state = state,
                 currentSession = session,
                 rootTiles = rootTiles,
                 refinementTiles = refinementTiles,
-                activeTileIds = loadingTileIds.toSet(),
+                reservedTileIds = reservedTileIds,
+                downloadingIds = downloadingTileIds.toSet(),
             )
 
             if (nextTiles.isEmpty()) {
-                if (loadingTileIds.isNotEmpty()) {
-                    updateTileStatus("Čekám na ${loadingTileIds.size} rozpracované detail tiles")
+                if (pendingTileIds.isNotEmpty() || activationTileId != null) {
+                    val pendingCount = pendingTileIds.size + if (activationTileId != null) 1 else 0
+                    if (isDetailStreamingIdleReady()) {
+                        updateTileStatus("Čekám na aktivaci ${pendingCount} stažených detail tiles")
+                    } else if (isTouchGestureActive) {
+                        updateTileStatus("Staženo ${pendingCount} detail tiles, čekám na puštění prstu + ${TileStreamingPolicy.DETAIL_STREAMING_IDLE_DELAY_MS}ms")
+                    } else {
+                        updateTileStatus("Staženo ${pendingCount} detail tiles, čekám na zastavení kamery (${detailStreamingIdleRemainingMs()}ms)")
+                    }
+                } else if (downloadingTileIds.isNotEmpty()) {
+                    updateTileStatus("Čekám na ${downloadingTileIds.size} rozpracované downloady detail tiles")
                 } else if (session.bootstrap.manifest.tiles.isNotEmpty()) {
                     updateTileStatus(
                         detailCandidateSnapshot(
@@ -816,11 +1023,12 @@ fun ModelViewer(
                             currentSession = session,
                             rootTiles = rootTiles,
                             refinementTiles = refinementTiles,
-                            activeTileIds = loadingTileIds.toSet(),
+                            reservedTileIds = reservedTileIds,
+                            downloadingIds = downloadingTileIds.toSet(),
                         ),
                     )
                 }
-                delay(250)
+                delay(100)
                 continue
             }
 
@@ -830,33 +1038,66 @@ fun ModelViewer(
             )
 
             nextTiles.forEachIndexed { index, tile ->
-                if (tile.id !in loadingTileIds) {
-                    loadingTileIds += tile.id
+                if (tile.id !in downloadingTileIds) {
+                    downloadingTileIds += tile.id
                 }
 
                 launch {
                     try {
-                        val loaded = loadTile(
-                            state = state,
+                        val tileFile = downloadTile(
                             tile = tile,
                             tileIndex = index + 1,
                             tileCount = nextTiles.size,
                             token = token,
-                            updateViewBounds = false,
                         )
-                        if (token != loadToken || !loaded || !state.isTileVisible(tile.id)) {
+                        if (token != loadToken || tileFile == null) {
                             return@launch
                         }
 
-                        promoteResolvedTiles(state, tileMap, tile.id)
+                        if (!shouldDisplayTile(tile)) {
+                            state.markTileResolved(tile.id)
+                            Log.d(
+                                TAG,
+                                "Tile ${tile.id} kept hidden after download because overview error ${activeOverviewError} is better than tile error ${tile.error}",
+                            )
+                            updateTileStatus("Tile ${tile.id} stažena jen pro odemčení child tiles, overview je kvalitnější")
+                            promoteResolvedTiles(state, tileMap, tile.id)
+                            return@launch
+                        }
+
+                        pendingTileFiles[tile.id] = tileFile
+                        if (tile.id !in pendingTileIds) {
+                            pendingTileIds += tile.id
+                        }
+                        if (isDetailStreamingIdleReady()) {
+                            updateTileStatus("Tile ${tile.id} stažena, čeká na aktivaci do scény")
+                        } else if (isTouchGestureActive) {
+                            updateTileStatus("Tile ${tile.id} stažena, čeká na puštění prstu")
+                        } else {
+                            updateTileStatus("Tile ${tile.id} stažena, čeká na zastavení kamery")
+                        }
                     } finally {
-                        loadingTileIds.remove(tile.id)
+                        downloadingTileIds.remove(tile.id)
                         visibleTileCount = state.visibleTileCount()
                     }
                 }
             }
 
-            if (shouldUseDetailMode(state, rootTiles)) {
+            val currentOverviewStage = overviewStages.getOrNull(currentOverviewIndex)
+            val nextDetailModeActive = shouldUseDetailMode(
+                state = state,
+                tileMap = tileMap,
+                currentOverviewStage = currentOverviewStage,
+                currentDetailMode = detailModeActive,
+            )
+            if (nextDetailModeActive != detailModeActive) {
+                detailModeActive = nextDetailModeActive
+                Log.d(
+                    TAG,
+                    "Detail mode ${if (detailModeActive) "enabled" else "disabled"} zoom=${(state.zoomFactor() * 100).toInt()}% visibleTiles=${state.visibleTileCount()}",
+                )
+            }
+            if (detailModeActive) {
                 state.hideOverview()
             } else {
                 state.showOverview()
@@ -903,8 +1144,7 @@ fun ModelViewer(
 
                 val materialProvider = UbershaderProvider(engine)
                 val assetLoader = AssetLoader(engine, materialProvider, EntityManager.get())
-                val resourceLoader = ResourceLoader(engine)
-                val state = FilamentState(engine, renderer, scene, view, camera, assetLoader, resourceLoader)
+                val state = FilamentState(engine, renderer, scene, view, camera, assetLoader)
                 filamentState = state
 
                 var lastTouchX = 0f
@@ -914,6 +1154,10 @@ fun ModelViewer(
                 var lastFocusY = 0f
                 var activePointerId = MotionEvent.INVALID_POINTER_ID
                 var isPinching = false
+
+                fun markUserInteraction() {
+                    lastUserInteractionAtMs = SystemClock.uptimeMillis()
+                }
 
                 fun getPinchDistance(event: MotionEvent): Float {
                     if (event.pointerCount < 2) return 0f
@@ -939,6 +1183,8 @@ fun ModelViewer(
                 surfaceView.setOnTouchListener { viewRef, event ->
                     when (event.actionMasked) {
                         MotionEvent.ACTION_DOWN -> {
+                            markUserInteraction()
+                            isTouchGestureActive = true
                             activePointerId = event.getPointerId(0)
                             lastTouchX = event.x
                             lastTouchY = event.y
@@ -946,6 +1192,8 @@ fun ModelViewer(
                             true
                         }
                         MotionEvent.ACTION_POINTER_DOWN -> {
+                            markUserInteraction()
+                            isTouchGestureActive = true
                             if (event.pointerCount >= 2) {
                                 val (focusX, focusY) = getFocusPoint(event)
                                 lastFocusX = focusX
@@ -956,6 +1204,8 @@ fun ModelViewer(
                             true
                         }
                         MotionEvent.ACTION_MOVE -> {
+                            markUserInteraction()
+                            isTouchGestureActive = event.pointerCount > 0
                             when {
                                 event.pointerCount >= 2 -> {
                                     val currentDistance = getPinchDistance(event)
@@ -998,6 +1248,8 @@ fun ModelViewer(
                             true
                         }
                         MotionEvent.ACTION_POINTER_UP -> {
+                            markUserInteraction()
+                            isTouchGestureActive = (event.pointerCount - 1) > 0
                             if (event.pointerCount - 1 < 2) {
                                 isPinching = false
                                 lastPinchDistance = 0f
@@ -1016,6 +1268,8 @@ fun ModelViewer(
                             true
                         }
                         MotionEvent.ACTION_UP -> {
+                            markUserInteraction()
+                            isTouchGestureActive = false
                             activePointerId = MotionEvent.INVALID_POINTER_ID
                             isPinching = false
                             lastPinchDistance = 0f
@@ -1023,6 +1277,8 @@ fun ModelViewer(
                             true
                         }
                         MotionEvent.ACTION_CANCEL -> {
+                            markUserInteraction()
+                            isTouchGestureActive = false
                             activePointerId = MotionEvent.INVALID_POINTER_ID
                             isPinching = false
                             lastPinchDistance = 0f
@@ -1091,7 +1347,7 @@ fun ModelViewer(
                 .padding(12.dp),
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
-                Text("Tiles: $visibleTileCount viditelných / ${loadingTileIds.size} loading")
+                Text("Tiles: $visibleTileCount viditelných / ${downloadingTileIds.size} downloading / ${pendingTileIds.size + if (activationTileId != null) 1 else 0} pending")
                 Text(overviewStatusMessage)
                 Text(tileStatusMessage)
                 Text("Gesta: 1 prst orbit, 2 prsty pan + zoom")
