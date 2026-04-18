@@ -76,24 +76,6 @@ object Http2ClientManager {
             .build()
     }
 
-
-    // Klient specificky pro chunky s agressivnějším connection poolingem
-
-    val chunkClient: OkHttpClient by lazy {
-        client.newBuilder()
-            // Více paralelních připojení pro chunky
-            .connectionPool(
-                okhttp3.ConnectionPool(
-                    maxIdleConnections = 10,
-                    keepAliveDuration = 5,
-                    timeUnit = TimeUnit.MINUTES
-                )
-            )
-            .retryOnConnectionFailure(false)
-            .build()
-    }
-
-
      // Event listener pro monitoring HTTP/2 připojení
 
     private class Http2EventListener : okhttp3.EventListener() {
