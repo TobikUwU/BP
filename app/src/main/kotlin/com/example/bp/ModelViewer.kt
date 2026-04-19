@@ -8,11 +8,7 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceView
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Surface as ComposeSurface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -23,10 +19,8 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.bp.download.StreamSession
 import com.example.bp.download.StreamStage
@@ -313,29 +307,24 @@ fun ModelViewer(
     val pendingTileIds = remember(session.model.name) { mutableStateListOf<String>() }
     val pendingTileFiles = remember(session.model.name) { linkedMapOf<String, File>() }
     var activationTileId by remember(session.model.name) { mutableStateOf<String?>(null) }
-    var visibleTileCount by remember(session.model.name) { mutableIntStateOf(0) }
     var activeOverviewError by remember(session.model.name) { mutableStateOf<Double?>(null) }
     var detailModeActive by remember(session.model.name) { mutableStateOf(false) }
     var isTouchGestureActive by remember(session.model.name) { mutableStateOf(false) }
     var lastUserInteractionAtMs by remember(session.model.name) { mutableLongStateOf(0L) }
     var lastTileActivationAtMs by remember(session.model.name) { mutableLongStateOf(0L) }
     val tileActivationMutex = remember(session.model.name) { Mutex() }
-    var overviewStatusMessage by remember(session.model.name) {
-        mutableStateOf("Overview: čekám")
-    }
-    var tileStatusMessage by remember(session.model.name) {
-        mutableStateOf("Čekám na detailní tiles")
-    }
+    val lastOverviewStatusMessage = remember(session.model.name) { arrayOf("Overview: čekám") }
+    val lastTileStatusMessage = remember(session.model.name) { arrayOf("Čekám na detailní tiles") }
 
     fun updateTileStatus(message: String) {
-        if (tileStatusMessage == message) return
-        tileStatusMessage = message
+        if (lastTileStatusMessage[0] == message) return
+        lastTileStatusMessage[0] = message
         Log.d(TAG, message)
     }
 
     fun updateOverviewStatus(message: String) {
-        if (overviewStatusMessage == message) return
-        overviewStatusMessage = message
+        if (lastOverviewStatusMessage[0] == message) return
+        lastOverviewStatusMessage[0] = message
         Log.d(TAG, message)
     }
 
@@ -836,7 +825,6 @@ fun ModelViewer(
 
             state.registerTile(tile.id, asset, updateViewBounds)
             lastTileActivationAtMs = SystemClock.uptimeMillis()
-            visibleTileCount = state.visibleTileCount()
             updateTileStatus("Detail tile ${tile.id} načtena, viditelných ${state.visibleTileCount()}")
             return@withLock true
         }
@@ -860,13 +848,12 @@ fun ModelViewer(
         pendingTileIds.clear()
         pendingTileFiles.clear()
         activationTileId = null
-        visibleTileCount = 0
         activeOverviewError = null
         detailModeActive = false
         isTouchGestureActive = false
         lastUserInteractionAtMs = 0L
         lastTileActivationAtMs = 0L
-        overviewStatusMessage = "Overview: inicializace"
+        updateOverviewStatus("Overview: inicializace")
         updateTileStatus("Připravuji stream pro ${session.model.name}")
         Log.d(
             TAG,
@@ -954,7 +941,6 @@ fun ModelViewer(
                 tileMap = tileMap,
                 rootTiles = rootTiles,
             )
-            visibleTileCount = state.visibleTileCount()
 
             if (activationTileId == null && pendingTileIds.isNotEmpty() && isDetailStreamingIdleReady()) {
                 val nextPendingId = pendingTileIds.first()
@@ -983,7 +969,6 @@ fun ModelViewer(
                             pendingTileFiles.remove(nextPendingId)
                             pendingTileIds.remove(nextPendingId)
                             activationTileId = null
-                            visibleTileCount = state.visibleTileCount()
                         }
                     }
                 }
@@ -1078,7 +1063,6 @@ fun ModelViewer(
                         }
                     } finally {
                         downloadingTileIds.remove(tile.id)
-                        visibleTileCount = state.visibleTileCount()
                     }
                 }
             }
@@ -1341,17 +1325,5 @@ fun ModelViewer(
             modifier = Modifier.fillMaxSize()
         )
 
-        ComposeSurface(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(12.dp),
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Text("Tiles: $visibleTileCount viditelných / ${downloadingTileIds.size} downloading / ${pendingTileIds.size + if (activationTileId != null) 1 else 0} pending")
-                Text(overviewStatusMessage)
-                Text(tileStatusMessage)
-                Text("Gesta: 1 prst orbit, 2 prsty pan + zoom")
-            }
-        }
     }
 }

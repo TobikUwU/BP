@@ -10,8 +10,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -66,7 +70,8 @@ fun ModelScreen() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var downloadProgress by remember { mutableStateOf<DownloadProgress?>(null) }
     var cacheSize by remember { mutableStateOf(0L) }
-    var expanded by remember { mutableStateOf(false) }
+    var modelDropdownExpanded by remember { mutableStateOf(false) }
+    var isModelPickerExpanded by remember { mutableStateOf(true) }
     var downloadJob by remember { mutableStateOf<Job?>(null) }
     val isSelectedModelOpen = selectedModel?.name != null && activeSession?.model?.name == selectedModel?.name
 
@@ -116,7 +121,55 @@ fun ModelScreen() {
         onDispose { downloadJob?.cancel() }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    fun toggleSelectedModel() {
+        if (isSelectedModelOpen) {
+            downloadJob?.cancel()
+            activeSession = null
+            isViewerLoading = false
+            downloadProgress = null
+            errorMessage = null
+        } else {
+            selectedModel?.let { model ->
+                downloadJob?.cancel()
+                downloadJob = scope.launch {
+                    try {
+                        errorMessage = null
+                        val cached = downloadManager.getCachedSession(model)
+                        if (cached != null) {
+                            activeSession = cached
+                            return@launch
+                        }
+
+                        isLoading = true
+                        downloadProgress = null
+                        val session = downloadManager.downloadModelSmart(model) { progress ->
+                            downloadProgress = progress
+                        }
+
+                        if (session != null) {
+                            activeSession = session
+                            cacheSize = downloadManager.getCacheSize()
+                        } else {
+                            errorMessage = "Načtení stream bootstrapu selhalo"
+                        }
+                    } catch (e: Exception) {
+                        Log.e("ModelScreen", "Download error", e)
+                        errorMessage = "Chyba: ${e.message}"
+                    } finally {
+                        isLoading = false
+                        downloadProgress = null
+                    }
+                }
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+    ) {
         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Row(
@@ -160,137 +213,135 @@ fun ModelScreen() {
                         IconButton(onClick = { scope.launch { refreshModels() } }, enabled = !isLoading) {
                             Icon(Icons.Default.Refresh, contentDescription = "Obnovit")
                         }
-                    }
-                }
 
-                Spacer(modifier = Modifier.height(12.dp))
-
-                ExposedDropdownMenuBox(
-                    expanded = expanded,
-                    onExpandedChange = { expanded = !expanded && !isLoading }
-                ) {
-                    OutlinedTextField(
-                        value = selectedModel?.name ?: "Vyberte model",
-                        onValueChange = {},
-                        readOnly = true,
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .menuAnchor(),
-                        label = { Text("Model ze serveru") },
-                        enabled = !isLoading
-                    )
-
-                    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                        availableModels.forEach { model ->
-                            DropdownMenuItem(
-                                text = {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(model.name)
-                                            Text(
-                                                "${model.overviewStageCount} overview • ${model.tileCount} tiles • ${model.sizeInMB} MB",
-                                                style = MaterialTheme.typography.bodySmall
-                                            )
-                                            if (downloadManager.isModelDownloaded(model.name)) {
-                                                Text(
-                                                    "V cache",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
-                                            }
-                                        }
-                                    }
+                        IconButton(
+                            onClick = {
+                                modelDropdownExpanded = false
+                                isModelPickerExpanded = !isModelPickerExpanded
+                            }
+                        ) {
+                            Icon(
+                                imageVector = if (isModelPickerExpanded) {
+                                    Icons.Default.KeyboardArrowUp
+                                } else {
+                                    Icons.Default.KeyboardArrowDown
                                 },
-                                onClick = {
-                                    selectedModel = model
-                                    expanded = false
+                                contentDescription = if (isModelPickerExpanded) {
+                                    "Zabalit výběr modelu"
+                                } else {
+                                    "Rozbalit výběr modelu"
                                 }
                             )
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                if (isModelPickerExpanded) {
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                selectedModel?.let { model ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (downloadManager.isModelDownloaded(model.name)) {
-                                MaterialTheme.colorScheme.primaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.secondaryContainer
-                            }
-                        )
+                    ExposedDropdownMenuBox(
+                        expanded = modelDropdownExpanded,
+                        onExpandedChange = { modelDropdownExpanded = !modelDropdownExpanded && !isLoading }
                     ) {
-                        Column(modifier = Modifier.padding(12.dp)) {
-                            Text(model.name, fontWeight = FontWeight.Bold)
-                            Text("Strategy: ${model.streamingStrategy.ifBlank { "hybrid_overview_tiles" }}", style = MaterialTheme.typography.bodySmall)
-                            Text("Entry: ${model.entryFile}", style = MaterialTheme.typography.bodySmall)
-                            Text("Overview stages: ${model.overviewStageCount}", style = MaterialTheme.typography.bodySmall)
-                            Text("Detail tiles: ${model.tileCount}", style = MaterialTheme.typography.bodySmall)
-                            if (model.upgradeOrder.isNotEmpty()) {
-                                Text("Upgrade order: ${model.upgradeOrder.joinToString(" → ")}", style = MaterialTheme.typography.bodySmall)
-                            }
-                            if (downloadManager.isModelDownloaded(model.name)) {
-                                Text("Status: v cache", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-                            } else {
-                                Text("Status: není v cache", style = MaterialTheme.typography.bodySmall)
+                        OutlinedTextField(
+                            value = selectedModel?.name ?: "Vyberte model",
+                            onValueChange = {},
+                            readOnly = true,
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelDropdownExpanded) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor(),
+                            label = { Text("Model ze serveru") },
+                            enabled = !isLoading
+                        )
+
+                        DropdownMenu(expanded = modelDropdownExpanded, onDismissRequest = { modelDropdownExpanded = false }) {
+                            availableModels.forEach { model ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(model.name)
+                                                Text(
+                                                    "${model.overviewStageCount} overview • ${model.tileCount} tiles • ${model.sizeInMB} MB",
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                                if (downloadManager.isModelDownloaded(model.name)) {
+                                                    Text(
+                                                        "V cache",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.primary
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    },
+                                    onClick = {
+                                        selectedModel = model
+                                        modelDropdownExpanded = false
+                                    }
+                                )
                             }
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    selectedModel?.let { model ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (downloadManager.isModelDownloaded(model.name)) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                }
+                            )
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(model.name, fontWeight = FontWeight.Bold)
+                                Text("Strategy: ${model.streamingStrategy.ifBlank { "hybrid_overview_tiles" }}", style = MaterialTheme.typography.bodySmall)
+                                Text("Entry: ${model.entryFile}", style = MaterialTheme.typography.bodySmall)
+                                Text("Overview stages: ${model.overviewStageCount}", style = MaterialTheme.typography.bodySmall)
+                                Text("Detail tiles: ${model.tileCount}", style = MaterialTheme.typography.bodySmall)
+                                if (model.upgradeOrder.isNotEmpty()) {
+                                    Text("Upgrade order: ${model.upgradeOrder.joinToString(" → ")}", style = MaterialTheme.typography.bodySmall)
+                                }
+                                if (downloadManager.isModelDownloaded(model.name)) {
+                                    Text("Status: v cache", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                                } else {
+                                    Text("Status: není v cache", style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            selectedModel?.name ?: "Model není vybraný",
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            if (isSelectedModelOpen) {
+                                "Model je otevřený"
+                            } else {
+                                "Výběr modelu je zabalený"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Button(
-                    onClick = {
-                        if (isSelectedModelOpen) {
-                            downloadJob?.cancel()
-                            activeSession = null
-                            isViewerLoading = false
-                            downloadProgress = null
-                            errorMessage = null
-                        } else {
-                            selectedModel?.let { model ->
-                                downloadJob?.cancel()
-                                downloadJob = scope.launch {
-                                    try {
-                                        errorMessage = null
-                                        val cached = downloadManager.getCachedSession(model)
-                                        if (cached != null) {
-                                            activeSession = cached
-                                            return@launch
-                                        }
-
-                                        isLoading = true
-                                        downloadProgress = null
-                                        val session = downloadManager.downloadModelSmart(model) { progress ->
-                                            downloadProgress = progress
-                                        }
-
-                                        if (session != null) {
-                                            activeSession = session
-                                            cacheSize = downloadManager.getCacheSize()
-                                        } else {
-                                            errorMessage = "Načtení stream bootstrapu selhalo"
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.e("ModelScreen", "Download error", e)
-                                        errorMessage = "Chyba: ${e.message}"
-                                    } finally {
-                                        isLoading = false
-                                        downloadProgress = null
-                                    }
-                                }
-                            }
-                        }
-                    },
+                    onClick = { toggleSelectedModel() },
                     enabled = selectedModel != null && !isLoading,
                     modifier = Modifier.fillMaxWidth()
                 ) {
